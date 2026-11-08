@@ -408,9 +408,31 @@ function createEndpointPool(entries) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+export function buildCheckHostTarget(host, port) {
+  const normalizedHost = normalizeHost(host);
+  if (!isPublicHost(normalizedHost)) throw new Error('Invalid public proxy host');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid TCP port');
+  const formattedHost = normalizedHost.includes(':') ? `[${normalizedHost}]` : normalizedHost;
+  // Check-Host's /check-tcp API expects a URL-style host value, not bare host:port.
+  return `https://${formattedHost}:${port}`;
+}
+
+export function parseCheckHostTcpResult(data, node = CHECK_NODE) {
+  const result = data?.[node];
+  const row = Array.isArray(result) ? result[0] : result;
+  if (row && Number.isFinite(Number(row.time)) && Number(row.time) >= 0) {
+    return {
+      ok: true,
+      latency_ms: Math.max(1, Math.round(Number(row.time) * 1000)),
+      address: row.address || null,
+    };
+  }
+  if (row?.error) return { ok: false, error: String(row.error) };
+  return null;
+}
+
 async function probeEndpoint(endpoint) {
-  const host = endpoint.host.includes(':') ? `[${endpoint.host}]` : endpoint.host;
-  const target = `${host}:${endpoint.port}`;
+  const target = buildCheckHostTarget(endpoint.host, endpoint.port);
   const createUrl = new URL('https://check-host.net/check-tcp');
   createUrl.searchParams.set('host', target);
   createUrl.searchParams.set('node', CHECK_NODE);
@@ -429,7 +451,7 @@ async function probeEndpoint(endpoint) {
   if (!created?.request_id) return { pending: true, error: 'Check-Host did not return request_id' };
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    await sleep(attempt === 0 ? 700 : 900);
+    await sleep([900, 1400, 2000][attempt]);
     try {
       const response = await fetch(`https://check-host.net/check-result/${encodeURIComponent(created.request_id)}`, {
         headers: { accept: 'application/json', 'user-agent': 'LEDERG-Proxy-Scanner/1.0' },
@@ -437,12 +459,8 @@ async function probeEndpoint(endpoint) {
       });
       if (!response.ok) continue;
       const data = await response.json();
-      const result = data?.[CHECK_NODE];
-      const row = Array.isArray(result) ? result[0] : result;
-      if (row && Number.isFinite(Number(row.time))) {
-        return { ok: true, latency_ms: Math.max(1, Math.round(Number(row.time) * 1000)), address: row.address || null };
-      }
-      if (row?.error) return { ok: false, error: String(row.error) };
+      const parsed = parseCheckHostTcpResult(data);
+      if (parsed) return parsed;
     } catch {
       // A not-yet-ready result is retried a small bounded number of times.
     }
@@ -476,11 +494,17 @@ function applyProbeResult(state, endpoint, result, now) {
     updated.latency_ms = materiallyDifferent ? newLatency : previous.latency_ms;
     updated.success_count = Math.min(99, (previous.success_count || 0) + 1);
     updated.fail_count = 0;
+    updated.pending_count = 0;
     updated.last_success_at = new Date(now).toISOString();
     updated.address = result.address || previous.address || null;
+    updated.last_probe_error = null;
     updated.available = true;
-  } else if (!result?.pending) {
+  } else if (result?.pending) {
+    updated.pending_count = Math.min(99, (previous.pending_count || 0) + 1);
+    updated.last_probe_error = result.error || 'Check-Host result is still pending';
+  } else {
     updated.fail_count = (previous.fail_count || 0) + 1;
+    updated.last_probe_error = result?.error || 'TCP probe failed';
     if (updated.fail_count >= REMOVE_AFTER_FAILURES) updated.available = false;
   }
   state.endpoints[endpoint.key] = updated;
@@ -861,6 +885,12 @@ async function runScanner(env, scheduledTime = Date.now()) {
     checked: batch.length,
     tcp_ok: results.filter((result) => result?.ok).length,
     pending_or_errors: results.filter((result) => !result?.ok).length,
+    probe_results: results.map((result, index) => ({
+      endpoint: batch[index].key,
+      status: result?.ok ? 'ok' : result?.pending ? 'pending' : 'failed',
+      latency_ms: result?.latency_ms ?? null,
+      error: result?.error || null,
+    })),
     active_configs: activeNodes.length,
     active_endpoints: new Set(activeNodes.map((node) => node.endpoint)).size,
     refreshed_feed: refresh.refreshed,
