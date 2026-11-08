@@ -1,15 +1,15 @@
 const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
-const CHECK_NODE = 'ru1.node.check-host.net';
+const PROBE_TIMEOUT_MS = 5000;
 const STATE_KEY = 'scanner-state-v1';
-const FEED_TTL_MS = 6 * 60 * 60 * 1000;
-const FEED_RETRY_COOLDOWN_MS = 45 * 60 * 1000;
-const MAX_SOURCE_BYTES = 256 * 1024;
+const FEED_TTL_MS = 9 * 60 * 1000;
+const FEED_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+const MAX_SOURCE_BYTES = 768 * 1024;
 const MAX_POOL_ENDPOINTS = 300;
 const MAX_CONFIGS_PER_FEED = 120;
 const CHECKS_PER_RUN = 20;
-const PROBE_CONCURRENCY = 5;
-const ACTIVE_TTL_MS = 18 * 60 * 60 * 1000;
+const PROBE_CONCURRENCY = 6;
+const ACTIVE_TTL_MS = 35 * 60 * 1000;
 const REMOVE_AFTER_FAILURES = 2;
 const REQUEST_TIMEOUT_MS = 12000;
 
@@ -22,51 +22,13 @@ export function calculateSweepMinutes(totalEndpoints, batchSize = CHECKS_PER_RUN
   }
   return totalEndpoints === 0 ? 0 : Math.ceil(totalEndpoints / batchSize);
 }
-const GITHUB_API = 'https://api.github.com';
 
 export const FEEDS = [
-  {
-    id: 'nodesradar-global',
-    name: 'Free Nodes Radar — global',
-    url: 'https://radarhub.top/v2ray.txt',
-    country: null,
-    priority: 1,
-  },
-  {
-    id: 'nodesradar-nl',
-    name: 'Free Nodes Radar — Netherlands',
-    url: 'https://radarhub.top/by-country/netherlands.txt',
-    country: 'NL',
-    priority: 0,
-  },
-  {
-    id: 'nomorewalls',
-    name: 'peasoft/NoMoreWalls',
-    url: 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt',
-    country: null,
-    priority: 2,
-  },
-  {
-    id: 'ts-sf-fly',
-    name: 'ts-sf/fly',
-    url: 'https://raw.githubusercontent.com/ts-sf/fly/main/v2',
-    country: null,
-    priority: 3,
-  },
-  {
-    id: 'v2ray-aggregator',
-    name: 'mahdibland/V2RayAggregator',
-    url: 'https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt',
-    country: null,
-    priority: 4,
-  },
-  {
-    id: 'aliilapro',
-    name: 'ALIILAPRO/v2rayNG-Config',
-    url: 'https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt',
-    country: null,
-    priority: 5,
-  },
+  { id: 'nomorewalls', name: 'peasoft/NoMoreWalls', url: 'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt', country: null, priority: 0 },
+  { id: 'ts-sf-fly', name: 'ts-sf/fly', url: 'https://raw.githubusercontent.com/ts-sf/fly/main/v2', country: null, priority: 1 },
+  { id: 'morpheusadam-lite', name: 'morpheusadam/v2ray-config — lite', url: 'https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/lite.txt', country: null, priority: 2 },
+  { id: 'alirewa-config', name: 'Alirewa/V2ray-Configs', url: 'https://raw.githubusercontent.com/Alirewa/V2ray-Configs/main/config.txt', country: null, priority: 3 },
+  { id: 'chaishpish-tfmtproto', name: 'chaishpish/free_server_v2ray', url: 'https://raw.githubusercontent.com/chaishpish/free_server_v2ray/main/%40TFMTProto', country: null, priority: 4 },
 ];
 
 const COUNTRY_HINTS = [
@@ -418,61 +380,29 @@ function createEndpointPool(entries) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export function buildCheckHostTarget(host, port) {
-  const normalizedHost = normalizeHost(host);
-  if (!isPublicHost(normalizedHost)) throw new Error('Invalid public proxy host');
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid TCP port');
-  const formattedHost = normalizedHost.includes(':') ? `[${normalizedHost}]` : normalizedHost;
-  // Check-Host's /check-tcp API expects a URL-style host value, not bare host:port.
-  return `https://${formattedHost}:${port}`;
-}
-
-export function parseCheckHostTcpResult(data, node = CHECK_NODE) {
-  const result = data?.[node];
-  const row = Array.isArray(result) ? result[0] : result;
-  if (row && Number.isFinite(Number(row.time)) && Number(row.time) >= 0) {
-    return {
-      ok: true,
-      latency_ms: Math.max(1, Math.round(Number(row.time) * 1000)),
-      address: row.address || null,
-    };
+export async function probeTcpSocket(endpoint, connectFn, timeoutMs = PROBE_TIMEOUT_MS) {
+  if (typeof connectFn !== 'function') return { ok: false, error: 'Cloudflare TCP socket connector is unavailable' };
+  if (!endpoint?.host || !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
+    return { ok: false, error: 'Invalid TCP endpoint' };
   }
-  if (row?.error) return { ok: false, error: String(row.error) };
-  return null;
-}
-
-async function probeEndpoint(endpoint) {
-  const target = buildCheckHostTarget(endpoint.host, endpoint.port);
-  const createUrl = new URL('https://check-host.net/check-tcp');
-  createUrl.searchParams.set('host', target);
-  createUrl.searchParams.set('node', CHECK_NODE);
-  let created;
+  const startedAt = performance.now();
+  let socket;
+  let timeoutId;
   try {
-    const response = await fetch(createUrl, {
-      headers: { accept: 'application/json', 'user-agent': 'LEDERG-Proxy-Scanner/1.0' },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    if (response.status === 429) return { pending: true, error: 'Check-Host rate limit' };
-    if (!response.ok) return { pending: true, error: `Check-Host HTTP ${response.status}` };
-    created = await response.json();
+    socket = connectFn({ hostname: endpoint.host, port: endpoint.port }, { secureTransport: 'off', allowHalfOpen: false });
+    if (!socket?.opened || typeof socket.close !== 'function') throw new Error('TCP socket did not expose opened/close');
+    const opened = await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error('TCP connect timeout')), timeoutMs); }),
+    ]);
+    const latencyMs = Math.max(1, Math.round(performance.now() - startedAt));
+    try { socket.close(); } catch { /* handshake already succeeded */ }
+    return { ok: true, latency_ms: latencyMs, address: opened?.remoteAddress || null };
   } catch (error) {
-    return { pending: true, error: error instanceof Error ? error.message : String(error) };
-  }
-  if (!created?.request_id) return { pending: true, error: 'Check-Host did not return request_id' };
-
-  // One bounded result poll keeps the scanner within the Free plan's outbound subrequest budget.
-  await sleep(1500);
-  try {
-    const response = await fetch(`https://check-host.net/check-result/${encodeURIComponent(created.request_id)}`, {
-      headers: { accept: 'application/json', 'user-agent': 'LEDERG-Proxy-Scanner/1.0' },
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    if (!response.ok) return { pending: true, error: `Check-Host result HTTP ${response.status}` };
-    const data = await response.json();
-    const parsed = parseCheckHostTcpResult(data);
-    return parsed || { pending: true, error: 'Check-Host result not ready after one poll' };
-  } catch (error) {
-    return { pending: true, error: error instanceof Error ? error.message : String(error) };
+    try { socket?.close?.(); } catch { /* ignore close errors */ }
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
   }
 }
 
@@ -701,7 +631,7 @@ export function buildHappJsonConfigs(nodes) {
             { type: 'field', outboundTag: 'proxy', network: 'tcp,udp' },
           ],
         },
-        meta: { serverDescription: `${node.source || 'public source'}; Moscow TCP ${Math.round(Number(node.ping_ms) || 0)}ms` },
+        meta: { serverDescription: `${node.source || 'public source'}; Cloudflare edge TCP ${Math.round(Number(node.ping_ms) || 0)}ms` },
       });
       if (profiles.length >= 150) break;
     } catch {
@@ -724,11 +654,10 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
     schema: 'lederg-proxy-feed/v1',
     updated_at: now,
     probe: {
-      provider: 'Check-Host',
-      node: CHECK_NODE,
-      location: 'Moscow, Russia',
-      method: 'TCP',
-      meaning: 'TCP port reachability and connect time; this is not a full VPN-tunnel or exit-IP test.',
+      provider: 'Cloudflare Workers TCP sockets',
+      location: 'Cloudflare edge (not a fixed city)',
+      method: 'TCP handshake',
+      meaning: 'TCP port reachability and handshake time from the Cloudflare Worker edge; this is not a full VPN-tunnel or exit-IP test.',
     },
     stats: {
       candidate_endpoints: candidates,
@@ -755,81 +684,6 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
   };
 }
 
-function encodeBase64Utf8(text) {
-  const bytes = new TextEncoder().encode(String(text));
-  let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-  }
-  return btoa(binary);
-}
-
-function decodeGitHubContent(encoded) {
-  const value = String(encoded ?? '').replace(/\s+/g, '');
-  const binary = atob(value);
-  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
-}
-
-async function readGitHubFile(env, path) {
-  const url = `${GITHUB_API}/repos/${REPO}/contents/${path}?ref=${encodeURIComponent(BRANCH)}`;
-  const response = await fetch(url, {
-    headers: {
-      accept: 'application/vnd.github+json',
-      authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      'x-github-api-version': '2022-11-28',
-      'user-agent': 'LEDERG-Proxy-Scanner/1.0',
-    },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (response.status === 404) return { sha: null, content: null };
-  if (!response.ok) throw new Error(`GitHub read ${path}: HTTP ${response.status}`);
-  const data = await response.json();
-  return { sha: data.sha, content: decodeGitHubContent(data.content || '') };
-}
-
-async function writeGitHubFile(env, path, content, sha, message) {
-  const response = await fetch(`${GITHUB_API}/repos/${REPO}/contents/${path}`, {
-    method: 'PUT',
-    headers: {
-      accept: 'application/vnd.github+json',
-      authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      'content-type': 'application/json',
-      'x-github-api-version': '2022-11-28',
-      'user-agent': 'LEDERG-Proxy-Scanner/1.0',
-    },
-    body: JSON.stringify({
-      message,
-      content: encodeBase64Utf8(content),
-      branch: BRANCH,
-      ...(sha ? { sha } : {}),
-    }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`GitHub write ${path}: HTTP ${response.status} ${detail.slice(0, 250)}`);
-  }
-  return response.json();
-}
-
-async function publishToGitHub(env, happJsonText, subscriptionText, manifestText) {
-  if (!env.GITHUB_TOKEN) return { skipped: true, reason: 'GITHUB_TOKEN secret is not configured' };
-  const outputs = [
-    ['json', happJsonText, 'chore(proxy): update HAPP Xray JSON array'],
-    ['happ.txt', subscriptionText, 'chore(proxy): update HAPP text subscription'],
-    ['manifest.json', manifestText, 'chore(proxy): update proxy scanner manifest'],
-  ];
-  const changes = {};
-  for (const [path, content, message] of outputs) {
-    const file = await readGitHubFile(env, path);
-    const changed = file.content !== content;
-    changes[path] = changed;
-    if (changed) await writeGitHubFile(env, path, content, file.sha, message);
-  }
-  return { skipped: false, changes };
-}
-
 async function persistState(env, state) {
   await env.STATE.put(STATE_KEY, JSON.stringify(state), { expirationTtl: 30 * 24 * 60 * 60 });
 }
@@ -839,7 +693,7 @@ async function sha256Hex(value) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function runScanner(env, scheduledTime = Date.now()) {
+async function runScanner(env, scheduledTime = Date.now(), tcpConnect = env.TCP_CONNECT) {
   if (!env.STATE) throw new Error('STATE KV binding is missing');
   const now = Number(scheduledTime) || Date.now();
   const state = await env.STATE.get(STATE_KEY, 'json') || { cursor: 0, endpoints: {}, source_errors: {}, last_run: null };
@@ -857,7 +711,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const start = Math.max(0, Number(state.cursor) || 0) % pool.length;
   const batch = [];
   for (let i = 0; i < Math.min(CHECKS_PER_RUN, pool.length); i += 1) batch.push(pool[(start + i) % pool.length]);
-  const results = await mapLimit(batch, PROBE_CONCURRENCY, probeEndpoint);
+  const results = await mapLimit(batch, PROBE_CONCURRENCY, (endpoint) => probeTcpSocket(endpoint, tcpConnect));
   results.forEach((result, index) => applyProbeResult(state, batch[index], result, now));
   state.cursor = (start + batch.length) % pool.length;
 
@@ -877,17 +731,12 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const publishedAt = contentChanged ? new Date(now).toISOString() : (state.last_published_at || new Date(now).toISOString());
   const stablePayload = buildManifest({ now: publishedAt, candidates: pool.length, checked: batch.length, nodes: activeNodes });
   const manifestText = `${JSON.stringify(stablePayload, null, 2)}\n`;
-  let publish = { skipped: true, reason: env.GITHUB_TOKEN ? 'No content changes' : 'GITHUB_TOKEN secret is not configured' };
-  if (env.GITHUB_TOKEN && contentChanged) {
-    publish = await publishToGitHub(env, happJsonText, subscriptionText, manifestText);
-    if (!publish.skipped) {
-      state.last_published_at = stablePayload.updated_at;
-      state.last_content_fingerprint = contentFingerprint;
-    }
-  }
+  const publish = { skipped: true, reason: 'Outputs are stored in Cloudflare KV; GitHub is used only as a public source' };
+  state.last_content_fingerprint = contentFingerprint;
   await env.STATE.put('last-manifest', manifestText, { expirationTtl: 30 * 24 * 60 * 60 });
   await env.STATE.put('last-happ-json', happJsonText, { expirationTtl: 30 * 24 * 60 * 60 });
   await env.STATE.put('last-happ-subscription', subscriptionText, { expirationTtl: 30 * 24 * 60 * 60 });
+  delete state.last_error;
   state.last_run = {
     at: new Date(now).toISOString(),
     candidate_endpoints: pool.length,
@@ -905,7 +754,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
     active_endpoints: new Set(activeNodes.map((node) => node.endpoint)).size,
     refreshed_feed: refresh.refreshed,
     feed_refresh_error: refresh.error,
-    github_publish: publish,
+    output_storage: 'Cloudflare KV',
   };
   await persistState(env, state);
   console.log(JSON.stringify({ message: 'proxy scan completed', ...state.last_run }));
@@ -921,12 +770,11 @@ export default {
       return Response.json({
         service: 'LEDERG PROXY SCANNER',
         status: 'online',
-        github_token_configured: Boolean(env.GITHUB_TOKEN),
         repository: REPO,
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
-        probe: { provider: 'Check-Host', node: CHECK_NODE, location: 'Moscow, Russia', method: 'TCP' },
-        schedule: '* * * * * (UTC; 20 probes per minute)',
+        probe: { provider: 'Cloudflare Workers TCP sockets', location: 'Cloudflare edge', method: 'TCP handshake' },
+        schedule: '* * * * * UTC; 20 TCP probes per minute; up to 300 endpoints per 15-minute sweep',
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
       }, { headers: { 'cache-control': 'no-store' } });
@@ -952,9 +800,9 @@ export default {
     return Response.json({ error: 'Not found' }, { status: 404 });
   },
 
-  async scheduled(controller, env) {
+  async scheduled(controller, env, tcpConnect) {
     try {
-      await runScanner(env, controller.scheduledTime);
+      await runScanner(env, controller.scheduledTime, tcpConnect);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(JSON.stringify({ message: 'scheduled scan failed', error: message }));
