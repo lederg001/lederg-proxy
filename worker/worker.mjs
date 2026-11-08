@@ -7,11 +7,21 @@ const FEED_RETRY_COOLDOWN_MS = 45 * 60 * 1000;
 const MAX_SOURCE_BYTES = 256 * 1024;
 const MAX_POOL_ENDPOINTS = 300;
 const MAX_CONFIGS_PER_FEED = 120;
-const CHECKS_PER_RUN = 8;
-const PROBE_CONCURRENCY = 3;
+const CHECKS_PER_RUN = 20;
+const PROBE_CONCURRENCY = 5;
 const ACTIVE_TTL_MS = 18 * 60 * 60 * 1000;
 const REMOVE_AFTER_FAILURES = 2;
 const REQUEST_TIMEOUT_MS = 12000;
+
+export function calculateSweepMinutes(totalEndpoints, batchSize = CHECKS_PER_RUN) {
+  if (!Number.isInteger(totalEndpoints) || totalEndpoints < 0) {
+    throw new Error('totalEndpoints must be a non-negative integer');
+  }
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error('batchSize must be a positive integer');
+  }
+  return totalEndpoints === 0 ? 0 : Math.ceil(totalEndpoints / batchSize);
+}
 const GITHUB_API = 'https://api.github.com';
 
 export const FEEDS = [
@@ -450,22 +460,20 @@ async function probeEndpoint(endpoint) {
   }
   if (!created?.request_id) return { pending: true, error: 'Check-Host did not return request_id' };
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    await sleep([900, 1400, 2000][attempt]);
-    try {
-      const response = await fetch(`https://check-host.net/check-result/${encodeURIComponent(created.request_id)}`, {
-        headers: { accept: 'application/json', 'user-agent': 'LEDERG-Proxy-Scanner/1.0' },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (!response.ok) continue;
-      const data = await response.json();
-      const parsed = parseCheckHostTcpResult(data);
-      if (parsed) return parsed;
-    } catch {
-      // A not-yet-ready result is retried a small bounded number of times.
-    }
+  // One bounded result poll keeps the scanner within the Free plan's outbound subrequest budget.
+  await sleep(1500);
+  try {
+    const response = await fetch(`https://check-host.net/check-result/${encodeURIComponent(created.request_id)}`, {
+      headers: { accept: 'application/json', 'user-agent': 'LEDERG-Proxy-Scanner/1.0' },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!response.ok) return { pending: true, error: `Check-Host result HTTP ${response.status}` };
+    const data = await response.json();
+    const parsed = parseCheckHostTcpResult(data);
+    return parsed || { pending: true, error: 'Check-Host result not ready after one poll' };
+  } catch (error) {
+    return { pending: true, error: error instanceof Error ? error.message : String(error) };
   }
-  return { pending: true, error: 'Check-Host result not ready' };
 }
 
 async function mapLimit(items, limit, mapper) {
@@ -727,6 +735,7 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       checked_this_run: checked,
       active_endpoints: endpoints.size,
       active_configs: sorted.length,
+      estimated_sweep_minutes: calculateSweepMinutes(candidates),
       by_country: byCountry,
     },
     sources: FEEDS.map(({ id, name, url, country }) => ({ id, name, url, country_filter: country })),
@@ -840,7 +849,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const refreshedEntries = await loadFeedCaches(env);
   const pool = createEndpointPool(refreshedEntries);
   if (!pool.length) {
-    state.last_run = { at: new Date(now).toISOString(), candidate_endpoints: 0, checked: 0, active_configs: 0, error: refresh.error || 'No valid proxy endpoints found in sources' };
+    state.last_run = { at: new Date(now).toISOString(), candidate_endpoints: 0, checked: 0, active_configs: 0, estimated_sweep_minutes: 0, error: refresh.error || 'No valid proxy endpoints found in sources' };
     await persistState(env, state);
     return state.last_run;
   }
@@ -885,6 +894,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
     checked: batch.length,
     tcp_ok: results.filter((result) => result?.ok).length,
     pending_or_errors: results.filter((result) => !result?.ok).length,
+    estimated_sweep_minutes: calculateSweepMinutes(pool.length),
     probe_results: results.map((result, index) => ({
       endpoint: batch[index].key,
       status: result?.ok ? 'ok' : result?.pending ? 'pending' : 'failed',
@@ -916,7 +926,8 @@ export default {
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
         probe: { provider: 'Check-Host', node: CHECK_NODE, location: 'Moscow, Russia', method: 'TCP' },
-        schedule: '*/15 * * * * (UTC)',
+        schedule: '* * * * * (UTC; 20 probes per minute)',
+        estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
       }, { headers: { 'cache-control': 'no-store' } });
     }
