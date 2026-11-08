@@ -13,7 +13,8 @@
     "checked_this_run": 0,
     "active_endpoints": 0,
     "active_configs": 0,
-    "by_country": {}
+    "by_country": {},
+    "estimated_sweep_minutes": 0
   },
   "sources": [
     {
