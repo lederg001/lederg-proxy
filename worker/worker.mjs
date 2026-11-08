@@ -439,7 +439,7 @@ function applyProbeResult(state, endpoint, result, now) {
     updated.available = true;
   } else if (result?.pending) {
     updated.pending_count = Math.min(99, (previous.pending_count || 0) + 1);
-    updated.last_probe_error = result.error || 'Check-Host result is still pending';
+    updated.last_probe_error = result.error || 'TCP handshake is still pending';
   } else {
     updated.fail_count = (previous.fail_count || 0) + 1;
     updated.last_probe_error = result?.error || 'TCP probe failed';
