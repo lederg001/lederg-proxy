@@ -1,0 +1,3 @@
+#profile-title: LEDERG PROXY
+#subscriptions-sort-type: ping
+#subscription-auto-update-open-enable: 1
