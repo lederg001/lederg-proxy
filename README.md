@@ -19,7 +19,7 @@ Endpoints:
 - `/happ` — current text subscription
 - `/manifest` — latest scan manifest
 
-Schedule: every 15 minutes (UTC). Each run refreshes at most one stale source and probes a bounded batch of candidate endpoints.
+Schedule: every minute (UTC). Each run probes up to 20 endpoints; with the 300-endpoint pool cap, every endpoint is revisited in approximately 15 minutes. A probe uses one Check-Host TCP dispatch and one result poll. Each run refreshes at most one stale source.
 
 ## Required secret
 
@@ -29,7 +29,7 @@ In Cloudflare Workers & Pages → `lederg-proxy-scanner` → Settings → Variab
 - Scope: only this repository, `lederg001/lederg-proxy`
 - Permission: Contents — Read and write
 
-The token is read from the Worker secret and is never committed to this repository.
+The token must be created as a **Secret** (not a plain-text variable), is read only from the Worker secret binding, and is never committed to this repository. A previously configured plain-text token was removed; revoke it in GitHub and create a replacement before adding the new Secret.
 
 ## Sources
 
