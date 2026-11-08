@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildCheckHostTarget,
+  calculateSweepMinutes,
   parseCheckHostTcpResult,
 } from './worker.mjs';
 
@@ -41,4 +42,13 @@ test('parses a TCP connection error', () => {
 
 test('leaves an unfinished Check-Host request pending', () => {
   assert.equal(parseCheckHostTcpResult({ 'ru1.node.check-host.net': null }), null);
+});
+
+test('rotates a 300-endpoint pool in 15 one-minute scan batches', () => {
+  assert.equal(calculateSweepMinutes(300, 20), 15);
+});
+
+test('rounds partial scan batches up and handles an empty pool', () => {
+  assert.equal(calculateSweepMinutes(21, 20), 2);
+  assert.equal(calculateSweepMinutes(0, 20), 0);
 });
