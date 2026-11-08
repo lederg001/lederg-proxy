@@ -1,0 +1,57 @@
+{
+  "schema": "lederg-proxy-feed/v1",
+  "updated_at": null,
+  "probe": {
+    "provider": "Check-Host",
+    "node": "ru1.node.check-host.net",
+    "location": "Moscow, Russia",
+    "method": "TCP",
+    "meaning": "TCP port reachability and connect time; not a full VPN tunnel, exit-IP, throughput, or censorship test."
+  },
+  "stats": {
+    "candidate_endpoints": 0,
+    "checked_this_run": 0,
+    "active_endpoints": 0,
+    "active_configs": 0,
+    "by_country": {}
+  },
+  "sources": [
+    {
+      "id": "nodesradar-global",
+      "name": "Free Nodes Radar — global",
+      "url": "https://radarhub.top/v2ray.txt",
+      "country_filter": null
+    },
+    {
+      "id": "nodesradar-nl",
+      "name": "Free Nodes Radar — Netherlands",
+      "url": "https://radarhub.top/by-country/netherlands.txt",
+      "country_filter": "NL"
+    },
+    {
+      "id": "nomorewalls",
+      "name": "peasoft/NoMoreWalls",
+      "url": "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+      "country_filter": null
+    },
+    {
+      "id": "ts-sf-fly",
+      "name": "ts-sf/fly",
+      "url": "https://raw.githubusercontent.com/ts-sf/fly/main/v2",
+      "country_filter": null
+    },
+    {
+      "id": "v2ray-aggregator",
+      "name": "mahdibland/V2RayAggregator",
+      "url": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
+      "country_filter": null
+    },
+    {
+      "id": "aliilapro",
+      "name": "ALIILAPRO/v2rayNG-Config",
+      "url": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
+      "country_filter": null
+    }
+  ],
+  "nodes": []
+}
