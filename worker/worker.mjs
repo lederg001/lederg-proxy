@@ -2,8 +2,8 @@ const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
 const GLOBALPING_API = 'https://api.globalping.io/v1';
 const GLOBALPING_REQUEST_TIMEOUT_MS = 9000;
-const GLOBALPING_POLL_ATTEMPTS = 3;
-const GLOBALPING_POLL_DELAY_MS = 800;
+const GLOBALPING_POLL_ATTEMPTS = 4;
+const GLOBALPING_POLL_DELAY_MS = 600;
 const HISTORY_SIZE = 5;
 const MOSCOW_CITY = 'Moscow';
 const MOSCOW_COUNTRY = 'RU';
@@ -394,45 +394,60 @@ export function parseGlobalpingTcpResult(payload) {
   }
 
   const entries = Array.isArray(payload?.results) ? payload.results : [];
-  const moscowEntry = entries.find(({ probe }) =>
-    String(probe?.city || '').toLowerCase() === MOSCOW_CITY.toLowerCase() &&
-    String(probe?.country || '').toUpperCase() === MOSCOW_COUNTRY
-  );
+  const moscowEntry = entries.find(({ probe }) => {
+    const location = probe?.location || probe || {};
+    return String(location.city || '').toLowerCase() === MOSCOW_CITY.toLowerCase() &&
+      String(location.country || '').toUpperCase() === MOSCOW_COUNTRY;
+  });
+
   if (!moscowEntry) {
     return { ok: false, error: 'Globalping returned no probe in Moscow, RU' };
   }
 
+  const location = moscowEntry.probe?.location || moscowEntry.probe || {};
   const result = moscowEntry.result || {};
   if (result.status === 'in-progress') {
     return { pending: true, error: 'Moscow probe is still running' };
   }
+  if (result.status !== 'finished') {
+    return {
+      ok: false,
+      error: result.error || result.rawOutput || 'Moscow TCP measurement did not finish successfully',
+      probe_location: 'Moscow',
+      network: location.network || null,
+      asn: location.asn || null,
+    };
+  }
+
   const stats = result.stats || {};
   const total = Math.max(0, Number(stats.total) || 0);
   const received = Math.max(0, Number(stats.rcv) || 0);
   const latency = Number(stats.avg);
   const minLatency = Number(stats.min);
   const maxLatency = Number(stats.max);
-  const lossPct = total > 0
-    ? Math.max(0, Math.min(100, ((total - received) / total) * 100))
-    : Number(stats.loss);
+  const lossPct = Number.isFinite(Number(stats.loss))
+    ? Number(stats.loss)
+    : (total > 0 ? ((total - received) / total) * 100 : 100);
 
   if (!Number.isFinite(latency) || received === 0) {
     return {
       ok: false,
-      error: result.rawOutput || result.error || 'Moscow TCP ping did not receive a response',
+      error: result.rawOutput || result.error || 'Moscow TCP ping received no replies',
       received,
       total,
-      loss_pct: Number.isFinite(lossPct) ? Math.round(lossPct * 10) / 10 : 100,
+      loss_pct: Math.max(0, Math.min(100, Math.round(lossPct * 10) / 10)),
       probe_location: 'Moscow',
-      network: moscowEntry.probe?.network || null,
+      network: location.network || null,
+      asn: location.asn || null,
     };
   }
 
-  const normalizedLoss = Number.isFinite(lossPct) ? Math.round(lossPct * 10) / 10 : 100;
+  const normalizedLoss = Math.max(0, Math.min(100, Math.round(lossPct * 10) / 10));
   const jitter = Number.isFinite(minLatency) && Number.isFinite(maxLatency)
     ? Math.max(0, maxLatency - minLatency)
     : 0;
   const ok = received >= Math.ceil(Math.max(1, total) * (2 / 3)) && normalizedLoss <= 33.4;
+
   return {
     ok,
     latency_ms: Math.max(1, Math.round(latency)),
@@ -441,8 +456,8 @@ export function parseGlobalpingTcpResult(payload) {
     received,
     total,
     probe_location: 'Moscow',
-    network: moscowEntry.probe?.network || null,
-    asn: moscowEntry.probe?.asn || null,
+    network: location.network || null,
+    asn: location.asn || null,
     error: ok ? null : 'Moscow TCP ping had excessive packet loss',
   };
 }
@@ -651,26 +666,58 @@ function truthyParam(value) {
   return ['1', 'true', 'yes'].includes(String(value ?? '').toLowerCase());
 }
 
-function buildXrayStreamSettings(network, security, values, fallbackHost) {
+export const MOSCOW_DNS_SERVERS = [
+  'https://common.dot.dns.yandex.net/dns-query',
+  'https://dns.adguard-dns.com/dns-query',
+  'https://dns.quad9.net/dns-query',
+  'https://dns.google/dns-query',
+];
+
+export function buildMoscowDnsConfig() {
+  return {
+    hosts: {
+      'common.dot.dns.yandex.net': '77.88.8.8',
+      'dns.adguard-dns.com': '94.140.14.14',
+      'dns.quad9.net': '9.9.9.9',
+      'dns.google': ['8.8.8.8', '8.8.4.4'],
+    },
+    servers: [...MOSCOW_DNS_SERVERS],
+    queryStrategy: 'UseIP',
+    disableCache: false,
+    disableFallback: false,
+    disableFallbackIfMatch: false,
+    enableParallelQuery: false,
+  };
+}
+
+export function buildXrayStreamSettings(network, security, values, fallbackHost) {
   const stream = { network: network || 'tcp', security: security || 'none' };
-  const sni = values.sni || values.serverName || values.host || fallbackHost;
+  const configuredSni = values.sni || values.serverName || values.host || values.server_name;
+  const sni = configuredSni || fallbackHost;
   const fingerprint = values.fp || values.fingerprint || 'chrome';
+
   if (stream.security === 'tls') {
     const tlsSettings = { serverName: sni, fingerprint };
     const alpn = String(values.alpn || '').split(',').map((item) => item.trim()).filter(Boolean);
     if (alpn.length) tlsSettings.alpn = alpn;
     if (truthyParam(values.allowInsecure || values.insecure)) tlsSettings.allowInsecure = true;
+    const echConfigList = values.echConfigList || values.ech;
+    if (echConfigList) tlsSettings.echConfigList = echConfigList;
     stream.tlsSettings = tlsSettings;
   } else if (stream.security === 'reality') {
-    const realitySettings = { serverName: sni, fingerprint };
-    const publicKey = values.pbk || values.publicKey;
+    const realitySettings = { fingerprint };
+    if (configuredSni) realitySettings.serverName = configuredSni;
+    const publicKey = values.pbk || values.password || values.publicKey;
     const shortId = values.sid || values.shortId;
     const spiderX = values.spx || values.spiderX;
-    if (publicKey) realitySettings.publicKey = publicKey;
+    if (publicKey) realitySettings.password = publicKey;
     if (shortId) realitySettings.shortId = shortId;
     if (spiderX) realitySettings.spiderX = spiderX;
+    const mldsa65Verify = values.mldsa65Verify || values.mldsa65_verify;
+    if (mldsa65Verify) realitySettings.mldsa65Verify = mldsa65Verify;
     stream.realitySettings = realitySettings;
   }
+
   if (stream.network === 'ws') {
     const headers = {};
     const wsHost = values.host || values.wsHost;
@@ -780,7 +827,7 @@ export function buildHappJsonConfigs(nodes) {
       profiles.push({
         remarks: `${location} | ${String(node.protocol).toUpperCase()} | Moscow ${Math.round(Number(node.ping_ms) || 0)}ms`,
         log: { loglevel: 'warning' },
-        dns: { servers: ['1.1.1.1', '1.0.0.1'], queryStrategy: 'UseIP' },
+        dns: buildMoscowDnsConfig(),
         inbounds: [{
           tag: 'socks-in', port: 10808, listen: '127.0.0.1', protocol: 'socks',
           settings: { auth: 'noauth', udp: true },
@@ -794,7 +841,16 @@ export function buildHappJsonConfigs(nodes) {
             { type: 'field', outboundTag: 'proxy', network: 'tcp,udp' },
           ],
         },
-        meta: { serverDescription: `${node.source || 'public source'}; Moscow TCP ${Math.round(Number(node.ping_ms) || 0)}ms; jitter ${Math.round(Number(node.jitter_ms) || 0)}ms; loss ${Number(node.loss_pct) || 0}%` },
+        meta: {
+          serverDescription: `${node.source || 'public source'}; Moscow TCP ${Math.round(Number(node.ping_ms) || 0)}ms; RTT spread ${Math.round(Number(node.jitter_ms) || 0)}ms; loss ${Number(node.loss_pct) || 0}%`,
+          moscowProbe: { city: 'Moscow', country: 'RU', network: node.probe_network || null },
+          tlsCamouflage: node.protocol === 'vless' && /[?&]security=reality(?:&|$)/i.test(node.uri)
+            ? 'REALITY + uTLS fingerprint from source link'
+            : /[?&]security=tls(?:&|$)/i.test(node.uri) || node.protocol === 'trojan'
+              ? 'TLS + uTLS Chrome fingerprint'
+              : 'Native protocol settings from source link',
+          dnsProviders: ['Yandex DoH', 'AdGuard DoH', 'Quad9 DoH', 'Google DoH'],
+        },
       });
       if (profiles.length >= 150) break;
     } catch {
@@ -820,8 +876,8 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       provider: 'Globalping community probes',
       city: MOSCOW_CITY,
       country: MOSCOW_COUNTRY,
-      method: 'TCP ping (3 connection attempts)',
-      meaning: 'TCP reachability, average latency, jitter and packet loss from a probe geolocated in Moscow, Russia; this does not authenticate a full VPN tunnel.',
+      method: 'TCP ping (3 packets)',
+      meaning: 'TCP reachability, average latency, RTT range and packet loss from a probe geolocated in Moscow, Russia; this does not authenticate a full VPN tunnel.',
     },
     stats: {
       candidate_endpoints: candidates,
@@ -947,7 +1003,7 @@ export default {
         repository: REPO,
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
-        probe: { provider: 'Globalping', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping' },
+        probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping' },
         schedule: '* * * * * UTC; 4 Moscow TCP measurements per minute; 60 candidates per 15-minute sweep; 240 tests/hour max',
         max_tests_per_hour: 240,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
