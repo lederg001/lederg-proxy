@@ -1,8 +1,8 @@
 const TEXT = new TextEncoder();
 const TEST_HOST = 'ipv4.download.thinkbroadband.com';
 const TEST_PATH = '/1MB.zip';
-const MIN_DOWNLOAD_BYTES = 64 * 1024;
-const MIN_DOWNLOAD_MBPS = 0.2;
+const MIN_DOWNLOAD_BYTES = 256 * 1024;
+const MIN_DOWNLOAD_MBPS = 1;
 const SOCKET_TIMEOUT_MS = 9000;
 const DOWNLOAD_TIMEOUT_MS = 10000;
 
@@ -113,17 +113,18 @@ class ByteQueue {
   }
   async readUntil(delimiter, maxBytes = 16384, ms = SOCKET_TIMEOUT_MS) {
     const marker = delimiter instanceof Uint8Array ? delimiter : TEXT.encode(delimiter);
-    while (this.buffer.length <= maxBytes) {
+    while (true) {
       outer: for (let i = 0; i <= this.buffer.length - marker.length; i += 1) {
         for (let j = 0; j < marker.length; j += 1) if (this.buffer[i + j] !== marker[j]) continue outer;
         const end = i + marker.length;
+        if (end > maxBytes) throw new Error('Proxy response header exceeded the size limit');
         const out = this.buffer.slice(0, end);
         this.buffer = this.buffer.slice(end);
         return out;
       }
+      if (this.buffer.length > maxBytes) throw new Error('Proxy response header exceeded the size limit');
       await this.fill(ms);
     }
-    throw new Error('Proxy response header exceeded the size limit');
   }
   async readSome(ms = DOWNLOAD_TIMEOUT_MS) {
     if (this.buffer.length) {
