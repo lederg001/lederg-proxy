@@ -10,7 +10,8 @@ import {
   evaluateMoscowHistory,
   parseGlobalpingTcpResult,
   parseGlobalpingMtrResult,
-  parseGlobalpingDohResult,
+  parseGlobalpingDnsResult,
+  parseGlobalpingDohTransportResult,
   probeMoscowPair,
   renderHappSubscription,
   parseProxyUri,
@@ -224,7 +225,7 @@ test('runs a Moscow TCP MTR and a real HTTPS DNS-over-HTTPS check for each candi
       calls.push(type);
       return type === 'mtr'
         ? { ok: true, latency_ms: 50, jitter_ms: 4, loss_pct: 0, hops: 9, network: 'Moscow ISP', probe_location: 'Moscow' }
-        : { ok: true, query_ms: 18, answer_count: 2, tls_authorized: true, provider: 'Yandex DoH', probe_location: 'Moscow' };
+        : { ok: true, query_ms: 18, answer_count: 2, tls_authorized: true, provider: 'Yandex UDP DNS', probe_location: 'Moscow' };
     },
   );
 
@@ -478,42 +479,82 @@ test('rejects Moscow MTR when the route never reaches the proxy endpoint', () =>
   assert.match(parsed.error, /endpoint|hop|loss/i);
 });
 
-test('requires valid Yandex DoH TLS and a positive DNS answer from Moscow', () => {
-  const parsed = parseGlobalpingDohResult({
+test('requires a positive Yandex DNS A response from a Moscow probe', () => {
+  const parsed = parseGlobalpingDnsResult({
     status: 'finished',
     results: [{
       probe: { city: 'Moscow', country: 'RU', network: 'Example Moscow ISP' },
       result: {
         status: 'finished',
-        statusCode: 200,
-        tls: { authorized: true, protocol: 'TLSv1.3' },
-        rawBody: JSON.stringify({ Status: 0, Answer: [{ type: 1, data: '198.51.100.10' }] }),
-        timings: { total: 88, dns: 9, tcp: 20, tls: 31, firstByte: 18, download: 10 },
+        statusCode: 0,
+        statusCodeName: 'NOERROR',
+        resolver: '77.88.8.8',
+        answers: [{ type: 'A', value: '198.51.100.10' }],
+        timings: { total: 18 },
       },
     }],
   }, 'proxy.example.net');
 
   assert.equal(parsed.ok, true);
-  assert.equal(parsed.query_ms, 88);
+  assert.equal(parsed.query_ms, 18);
   assert.equal(parsed.answer_count, 1);
-  assert.equal(parsed.tls_authorized, true);
-  assert.equal(parsed.provider, 'Yandex DoH');
+  assert.equal(parsed.provider, 'Yandex DNS (77.88.8.8)');
 });
 
-test('rejects DNS-over-HTTPS if the Moscow probe cannot validate the resolver TLS certificate', () => {
-  const parsed = parseGlobalpingDohResult({
+test('rejects Moscow DNS lookup if Yandex returns no usable A record', () => {
+  const parsed = parseGlobalpingDnsResult({
     status: 'finished',
     results: [{
       probe: { city: 'Moscow', country: 'RU' },
       result: {
         status: 'finished',
-        statusCode: 200,
-        tls: { authorized: false },
-        rawBody: JSON.stringify({ Status: 0, Answer: [{ type: 1, data: '198.51.100.10' }] }),
+        statusCode: 2,
+        statusCodeName: 'SERVFAIL',
+        resolver: '77.88.8.8',
+        answers: [],
         timings: { total: 88 },
       },
     }],
   }, 'proxy.example.net');
+
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /DNS|record/i);
+});
+
+test('validates TLS transport to the Yandex DoH endpoint from Moscow separately', () => {
+  const parsed = parseGlobalpingDohTransportResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU', network: 'Example Moscow ISP' },
+      result: {
+        status: 'finished',
+        statusCode: 400,
+        tls: { authorized: true, protocol: 'TLSv1.3' },
+        timings: { total: 55, dns: 4, tcp: 12, tls: 20, firstByte: 15, download: 4 },
+      },
+    }],
+  });
+
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.tls_authorized, true);
+  assert.equal(parsed.tls_protocol, 'TLSv1.3');
+  assert.equal(parsed.connect_ms, 12);
+  assert.equal(parsed.tls_ms, 20);
+});
+
+test('rejects the Yandex DoH path when the Moscow TLS handshake is not trusted', () => {
+  const parsed = parseGlobalpingDohTransportResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU' },
+      result: {
+        status: 'finished',
+        statusCode: 400,
+        tls: { authorized: false },
+        timings: { total: 55, tcp: 12, tls: 20 },
+      },
+    }],
+  });
 
   assert.equal(parsed.ok, false);
   assert.match(parsed.error, /TLS/i);
