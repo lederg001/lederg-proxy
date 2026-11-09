@@ -489,9 +489,10 @@ export function parseGlobalpingMtrResult(payload, targetHost = '') {
   }
 
   const hops = Array.isArray(result.hops) ? result.hops : [];
-  const resolvedAddress = normalizeHost(result.resolvedAddress);
+  const normalizeMtrAddress = (value) => String(value || '').replace(/^\\[|\\]$/g, '').toLowerCase();
+  const resolvedAddress = normalizeMtrAddress(result.resolvedAddress);
   const finalHop = [...hops].reverse().find((hop) =>
-    resolvedAddress && normalizeHost(hop?.resolvedAddress) === resolvedAddress
+    resolvedAddress && normalizeMtrAddress(hop?.resolvedAddress) === resolvedAddress
   );
   if (!finalHop) {
     return {
@@ -507,11 +508,12 @@ export function parseGlobalpingMtrResult(payload, targetHost = '') {
   const stats = finalHop.stats || {};
   const total = Math.max(0, Number(stats.total) || 0);
   const received = Math.max(0, Number(stats.rcv) || 0);
-  const latency = Number(stats.avg);
-  const lossPct = Number.isFinite(Number(stats.loss))
+  const latency = stats.avg == null ? Number.NaN : Number(stats.avg);
+  const lossPct = stats.loss != null && Number.isFinite(Number(stats.loss))
     ? Number(stats.loss)
     : (total > 0 ? ((total - received) / total) * 100 : 100);
-  const jitter = Number(stats.jAvg ?? stats.jMax ?? stats.stDev);
+  const jitterValue = stats.jAvg ?? stats.jMax ?? stats.stDev;
+  const jitter = jitterValue == null ? 0 : Number(jitterValue);
   const normalizedLoss = Math.max(0, Math.min(100, Math.round(lossPct * 10) / 10));
   const latencyMs = Number.isFinite(latency) ? Math.round(latency) : null;
   const jitterMs = Number.isFinite(jitter) ? Math.round(jitter) : 0;
@@ -536,50 +538,70 @@ export function parseGlobalpingMtrResult(payload, targetHost = '') {
   };
 }
 
-export function parseGlobalpingDohResult(payload, queryHost = '') {
+export function parseGlobalpingDnsResult(payload, queryHost = '') {
   const entry = findMoscowMeasurementEntry(payload);
   if (entry?.pending) return entry;
-  if (!entry) return { ok: false, error: 'Globalping returned no DoH probe in Moscow, RU' };
+  if (!entry) return { ok: false, error: 'Globalping returned no DNS probe in Moscow, RU' };
   const location = entry.probe?.location || entry.probe || {};
   const result = entry.result || {};
-  if (result.status === 'in-progress') return { pending: true, error: 'Moscow DNS-over-HTTPS test is still running' };
+  if (result.status === 'in-progress') return { pending: true, error: 'Moscow DNS query is still running' };
   if (result.status !== 'finished') {
-    return { ok: false, error: result.error || result.rawOutput || 'Moscow DNS-over-HTTPS test did not finish', probe_location: 'Moscow' };
+    return { ok: false, error: result.error || result.rawOutput || 'Moscow DNS query did not finish', probe_location: 'Moscow' };
   }
-
-  let body = null;
-  try { body = JSON.parse(String(result.rawBody || '')); } catch { /* malformed JSON is a failed DNS check */ }
-  const tlsAuthorized = result.tls?.authorized === true;
-  const httpStatus = Number(result.statusCode) || 0;
-  const answers = Array.isArray(body?.Answer) ? body.Answer : [];
-  const queryStatus = Number(body?.Status);
-  const timings = result.timings || {};
-  const queryMs = Number(timings.total);
-  const ok = httpStatus === 200 && tlsAuthorized && queryStatus === 0 && answers.length > 0 &&
-    Number.isFinite(queryMs);
+  const answers = Array.isArray(result.answers) ? result.answers : [];
+  const statusCode = Number(result.statusCode);
+  const queryMs = result.timings?.total == null ? Number.NaN : Number(result.timings.total);
+  const ok = statusCode === 0 && answers.length > 0 && Number.isFinite(queryMs);
   return {
     ok,
     query_ms: Number.isFinite(queryMs) ? Math.round(queryMs) : null,
     answer_count: answers.length,
     answers: answers.slice(0, 4).map((answer) => ({
-      type: Number(answer.type) || null,
-      value: String(answer.data || '').slice(0, 100),
+      type: String(answer.type || '').slice(0, 12),
+      value: String(answer.value || '').slice(0, 100),
     })),
+    resolver: result.resolver || '77.88.8.8',
+    provider: 'Yandex DNS (77.88.8.8)',
+    query_host: queryHost,
+    dns_status: Number.isFinite(statusCode) ? statusCode : null,
+    probe_location: 'Moscow',
+    network: location.network || null,
+    error: ok ? null : (statusCode !== 0
+      ? `Yandex DNS returned ${result.statusCodeName || `RCODE ${statusCode}`}`
+      : 'Yandex DNS returned no usable A record for the proxy endpoint'),
+  };
+}
+
+export function parseGlobalpingDohTransportResult(payload) {
+  const entry = findMoscowMeasurementEntry(payload);
+  if (entry?.pending) return entry;
+  if (!entry) return { ok: false, error: 'Globalping returned no Yandex DoH TLS probe in Moscow, RU' };
+  const location = entry.probe?.location || entry.probe || {};
+  const result = entry.result || {};
+  if (result.status === 'in-progress') return { pending: true, error: 'Yandex DoH TLS test is still running' };
+  if (result.status !== 'finished') {
+    return { ok: false, error: result.error || result.rawOutput || 'Yandex DoH TLS test did not finish', probe_location: 'Moscow' };
+  }
+  const timings = result.timings || {};
+  const tlsAuthorized = result.tls?.authorized === true;
+  const tcpMs = timings.tcp == null ? Number.NaN : Number(timings.tcp);
+  const tlsMs = timings.tls == null ? Number.NaN : Number(timings.tls);
+  const ok = tlsAuthorized && Number.isFinite(tcpMs) && Number.isFinite(tlsMs);
+  return {
+    ok,
     tls_authorized: tlsAuthorized,
     tls_protocol: result.tls?.protocol || null,
-    http_status: httpStatus,
-    dns_status: Number.isFinite(queryStatus) ? queryStatus : null,
+    connect_ms: Number.isFinite(tcpMs) ? Math.round(tcpMs) : null,
+    tls_ms: Number.isFinite(tlsMs) ? Math.round(tlsMs) : null,
+    total_ms: timings.total == null ? null : Math.round(Number(timings.total)),
+    http_status: Number(result.statusCode) || null,
     provider: 'Yandex DoH',
-    query_host: queryHost,
+    host: 'common.dot.dns.yandex.net',
     probe_location: 'Moscow',
     network: location.network || null,
     error: ok ? null : (!tlsAuthorized
       ? 'Yandex DoH TLS certificate validation failed from Moscow'
-      : (httpStatus !== 200
-        ? `Yandex DoH returned HTTP ${httpStatus}`
-        : (queryStatus !== 0
-          ? `Yandex DoH DNS response status is ${Number.isFinite(queryStatus) ? queryStatus : 'invalid'}`
-          : 'Yandex DoH returned no address for the proxy endpoint'))),
+      : 'Yandex DoH TCP/TLS timing is incomplete'),
   };
 }
 
@@ -640,21 +662,18 @@ export async function probeMoscow(endpoint, kind = 'mtr', fetchFn = fetch) {
       : endpoint.host;
     const query = `name=${encodeURIComponent(queryHost)}&type=A`;
     const measurement = await requestGlobalpingMeasurement(
-      'common.dot.dns.yandex.net',
-      'http',
+      queryHost,
+      'dns',
       {
-        protocol: 'HTTPS',
-        port: 443,
-        request: {
-          method: 'GET',
-          path: '/dns-query',
-          query,
-          headers: { accept: 'application/dns-json' },
-        },
+        query: { type: 'A' },
+        resolver: '77.88.8.8',
+        protocol: 'UDP',
+        port: 53,
+        trace: false,
       },
       fetchFn,
     );
-    return parseGlobalpingDohResult(measurement, queryHost);
+    return parseGlobalpingDnsResult(measurement, queryHost);
   }
 
   const measurement = await requestGlobalpingMeasurement(
@@ -664,6 +683,24 @@ export async function probeMoscow(endpoint, kind = 'mtr', fetchFn = fetch) {
     fetchFn,
   );
   return parseGlobalpingMtrResult(measurement, endpoint.host);
+}
+
+export async function probeMoscowDohTransport(fetchFn = fetch) {
+  const measurement = await requestGlobalpingMeasurement(
+    'common.dot.dns.yandex.net',
+    'http',
+    {
+      protocol: 'HTTPS',
+      port: 443,
+      request: {
+        method: 'HEAD',
+        path: '/dns-query',
+        headers: { accept: 'application/dns-message' },
+      },
+    },
+    fetchFn,
+  );
+  return parseGlobalpingDohTransportResult(measurement);
 }
 
 export async function probeMoscowPair(endpoint, probeFn = probeMoscow) {
@@ -1155,8 +1192,8 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       provider: 'Globalping community probes',
       city: MOSCOW_CITY,
       country: MOSCOW_COUNTRY,
-      method: 'Globalping TCP MTR (5 packets/hop) to the proxy port plus HTTPS Yandex DoH A-record lookup from a Moscow, RU probe; separate VLESS authentication, tunneled HTTP and download test from Cloudflare Worker egress',
-      meaning: 'Moscow MTR must reach the proxy endpoint with at least 80% replies, no more than 20% loss and RTT <=450ms. Yandex DoH must pass valid TLS and return an A-record. Full VLESS tunnel and speed are additionally verified from Cloudflare Worker egress, not Moscow.',
+      method: 'Globalping TCP MTR (5 packets/hop) to the proxy port and Yandex DNS A-record lookup (77.88.8.8/UDP) per Moscow proxy probe; a separate HTTPS/TLS reachability check to the Yandex DoH hostname each scan; full VLESS tunnel and download from Cloudflare Worker egress',
+      meaning: 'Moscow MTR must reach the proxy endpoint with at least 80% replies, no more than 20% loss and RTT <=450ms. Yandex DNS must return an A-record for the proxy hostname. A separate Moscow HTTPS test validates the Yandex DoH TLS endpoint. Full VLESS authentication, HTTP 200 and download speed are additionally verified from Cloudflare Worker egress, not Moscow.',
       functional_verification: { protocol: 'VLESS', transports: ['TCP', 'RAW', 'WebSocket'], security: ['none', 'TLS when endpoint SNI matches host'], min_download_bytes: PROXY_VERIFY_LIMITS.min_download_bytes, min_download_mbps: PROXY_VERIFY_LIMITS.min_download_mbps, probe_location: 'Cloudflare Worker egress, not Moscow' },
     },
     stats: {
@@ -1230,7 +1267,10 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const start = Math.max(0, Number(state.cursor) || 0) % pool.length;
   const batch = [];
   for (let i = 0; i < Math.min(CHECKS_PER_RUN, pool.length); i += 1) batch.push(pool[(start + i) % pool.length]);
-  const results = await mapLimit(batch, PROBE_CONCURRENCY, (endpoint) => probeMoscowPair(endpoint));
+  const [results, dohTransport] = await Promise.all([
+    mapLimit(batch, PROBE_CONCURRENCY, (endpoint) => probeMoscowPair(endpoint)),
+    probeMoscowDohTransport(),
+  ]);
   results.forEach((result, index) => applyProbeResult(state, batch[index], result, now));
 
   const verificationJobs = [];
@@ -1281,12 +1321,13 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const subscriptionText = renderHappSubscription(activeNodes);
   const happProfiles = buildHappJsonConfigs(activeNodes);
   const happJsonText = `${JSON.stringify(happProfiles, null, 2)}\n`;
-  const fingerprintPayload = buildManifest({ now: '', candidates: pool.length, checked: batch.length, measurements: batch.length * 2, nodes: activeNodes });
+  const measurementCount = batch.length * 2 + 1;
+  const fingerprintPayload = buildManifest({ now: '', candidates: pool.length, checked: batch.length, measurements: measurementCount, nodes: activeNodes });
   const contentFingerprint = await sha256Hex(`${JSON.stringify(fingerprintPayload)}\n${subscriptionText}\n${happJsonText}`);
   const contentChanged = contentFingerprint !== state.last_content_fingerprint;
   const publishedAt = contentChanged ? new Date(now).toISOString() : (state.last_published_at || new Date(now).toISOString());
   state.last_published_at = publishedAt;
-  const stablePayload = buildManifest({ now: publishedAt, candidates: pool.length, checked: batch.length, measurements: batch.length * 2, nodes: activeNodes });
+  const stablePayload = buildManifest({ now: publishedAt, candidates: pool.length, checked: batch.length, measurements: measurementCount, nodes: activeNodes });
   const manifestText = `${JSON.stringify(stablePayload, null, 2)}\n`;
   const publish = { skipped: true, reason: 'Outputs are stored in Cloudflare KV; GitHub is used only as a public source' };
   state.last_content_fingerprint = contentFingerprint;
@@ -1299,7 +1340,8 @@ async function runScanner(env, scheduledTime = Date.now()) {
     candidate_endpoints: pool.length,
     checked: batch.length,
     moscow_pairs_ok: results.filter((result) => result?.ok).length,
-    moscow_measurements: results.reduce((sum, result) => sum + (Number(result?.measurements_completed) || 0), 0),
+    moscow_measurements: results.reduce((sum, result) => sum + (Number(result?.measurements_completed) || 0), 0) + Number(dohTransport && !dohTransport.pending),
+    yandex_doh_transport: dohTransport,
     pending_or_errors: results.filter((result) => !result?.ok).length,
     estimated_sweep_minutes: calculateSweepMinutes(pool.length),
     protocol_checks: verificationResults.length,
@@ -1344,8 +1386,8 @@ export default {
         repository: REPO,
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
-        probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP MTR (5 packets/hop) + HTTPS Yandex DoH A-record lookup; VLESS tunnel, HTTP 200 and 256 KiB download speed from Cloudflare Worker egress' },
-        schedule: '15-minute scan; up to 30 endpoints; 2 Globalping measurements per endpoint (TCP MTR + HTTPS DoH); 240 measurements/hour max; VLESS auth + HTTP 200 + 256 KiB download >=1 Mbps from Worker egress',
+        probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP MTR (5 packets/hop) + Yandex DNS A-record lookup per endpoint; separate HTTPS/TLS reachability test to Yandex DoH once per scan; VLESS tunnel and download from Worker egress' },
+        schedule: '15-minute scan; up to 30 endpoints; 2 Globalping measurements per endpoint + 1 Yandex DoH TLS check per scan; 244 measurements/hour max; VLESS auth + HTTP 200 + 256 KiB download >=1 Mbps from Worker egress',
         max_tests_per_hour: 240,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
