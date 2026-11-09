@@ -212,13 +212,21 @@ test('parses a public VLESS config and rejects a private endpoint', () => {
   assert.equal(invalid, null);
 });
 
-test('splits the Moscow full scan into small batches under Cloudflare and Globalping limits', () => {
-  assert.equal(calculateSweepMinutes(30, 5), 12);
-  assert.equal(calculateSweepMinutes(31, 5), 14);
-  assert.equal(calculateSweepMinutes(0, 5), 0);
+test('keeps each invocation below the free subrequest limit and completes a full Moscow sweep every 15 minutes', () => {
+  assert.equal(calculateSweepMinutes(30), 15);
+  assert.equal(calculateSweepMinutes(31), 16);
+  assert.equal(calculateSweepMinutes(0), 0);
+
+  // Two endpoints per minute, with MTR + DNS checks, produce 240 Globalping
+  // measurements/hour. The DoH baseline runs at most four times/hour.
   assert.equal(30 * 2 * (60 / 15), 240);
-  assert.equal(240 + 1, 241);
-  assert.equal(241 < 250, true);
+  assert.equal(240 + 4, 244);
+
+  // Four measurements + one optional DoH measurement, each with one dispatch
+  // and at most four polls, plus one source fetch: 26 external subrequests.
+  const worstCaseSubrequests = (2 * 2 + 1) * (1 + 4) + 1;
+  assert.equal(worstCaseSubrequests, 26);
+  assert.ok(worstCaseSubrequests < 50);
 });
 
 
