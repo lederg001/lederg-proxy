@@ -1,4 +1,4 @@
-import { getVlessProbeSupport, PROXY_VERIFY_LIMITS, verifyVlessProxy } from './proxy-verifier.mjs';
+import { getVlessProbeSupport, PROXY_VERIFY_LIMITS, verifyVlessProxy, verifyVlessServices } from './proxy-verifier.mjs';
 
 const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
@@ -889,9 +889,13 @@ export function selectVerifiableConfigs(configs, limit = 3) {
 export function applyProxyVerificationResult(state, endpoint, config, result, now) {
   const status = state.endpoints[endpoint.key] || {};
   if (!status.verified_configs || typeof status.verified_configs !== 'object') status.verified_configs = {};
+  const services = result?.services || null;
+  const servicesOk = services?.youtube?.ok === true && services?.discord?.ok === true;
+  const verificationOk = Boolean(result?.ok && result?.supported !== false && servicesOk);
   const verification = {
-    ok: Boolean(result?.ok && result?.supported !== false),
+    ok: verificationOk,
     supported: result?.supported !== false,
+    services,
     verified_at: new Date(now).toISOString(),
     verifier: result?.verifier || 'VLESS protocol + HTTP egress',
     probe_location: result?.probe_location || 'Cloudflare Worker egress (not Moscow)',
@@ -902,7 +906,10 @@ export function applyProxyVerificationResult(state, endpoint, config, result, no
     download_mbps: Number(result?.download_mbps) || 0,
     http_status: Number(result?.http_status) || null,
     target: result?.target || null,
-    error: result?.ok ? null : (result?.error || 'Full proxy verification failed'),
+    error: verificationOk ? null : (
+      result?.error || services?.error ||
+      (!services ? 'YouTube and Discord HTTPS checks were not completed' : 'YouTube or Discord is unreachable through the proxy')
+    ),
   };
   status.verified_configs[config.uri] = verification;
   state.endpoints[endpoint.key] = status;
@@ -1128,7 +1135,7 @@ export function buildHappJsonConfigs(nodes) {
       if (!proxy) continue;
       const location = node.country_name || COUNTRY_NAMES[node.country] || 'Unknown';
       profiles.push({
-        remarks: `${location} | ${String(node.protocol).toUpperCase()} | Moscow ${Math.round(Number(node.ping_ms) || 0)}ms | DL ${Number(node.functional_probe.download_mbps).toFixed(2)} Mbps`,
+        remarks: `${location} | ${String(node.protocol).toUpperCase()} | Moscow ${Math.round(Number(node.ping_ms) || 0)}ms | YT ${node.functional_probe.services?.youtube?.response_ms ?? '—'}ms | DC ${node.functional_probe.services?.discord?.response_ms ?? '—'}ms | DL ${Number(node.functional_probe.download_mbps).toFixed(2)} Mbps`,
         log: { loglevel: 'warning' },
         dns: buildMoscowDnsConfig(),
         inbounds: [{
@@ -1165,7 +1172,9 @@ export function buildHappJsonConfigs(nodes) {
             download_mbps: node.functional_probe.download_mbps,
             http_status: node.functional_probe.http_status,
             target: node.functional_probe.target,
-            note: 'Moscow reachability is measured separately by Globalping; protocol and speed check runs from Cloudflare Worker egress.',
+            services: node.functional_probe.services,
+            required_services: ['YouTube HTTPS /generate_204', 'Discord HTTPS /api/v10/gateway'],
+            note: 'Moscow reachability is measured separately by Globalping. VLESS authentication, download and YouTube/Discord HTTPS checks run through the proxy from Cloudflare Worker egress, not Moscow.',
           },
         },
       });
@@ -1195,7 +1204,16 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       country: MOSCOW_COUNTRY,
       method: 'Globalping TCP MTR (5 packets/hop) to the proxy port and Yandex DNS A-record lookup (77.88.8.8/UDP) per Moscow proxy probe; a separate HTTPS/TLS reachability check to the Yandex DoH hostname each scan; full VLESS tunnel and download from Cloudflare Worker egress',
       meaning: 'Moscow MTR must reach the proxy endpoint with at least 80% replies, no more than 20% loss and RTT <=450ms. Yandex DNS must return an A-record for the proxy hostname. A separate Moscow HTTPS test validates the Yandex DoH TLS endpoint. Full VLESS authentication, HTTP 200 and download speed are additionally verified from Cloudflare Worker egress, not Moscow.',
-      functional_verification: { protocol: 'VLESS', transports: ['TCP', 'RAW', 'WebSocket'], security: ['none', 'TLS when endpoint SNI matches host'], min_download_bytes: PROXY_VERIFY_LIMITS.min_download_bytes, min_download_mbps: PROXY_VERIFY_LIMITS.min_download_mbps, probe_location: 'Cloudflare Worker egress, not Moscow' },
+      functional_verification: {
+        protocol: 'VLESS',
+        transports: ['TCP', 'RAW', 'WebSocket'],
+        security: ['none', 'TLS with source SNI'],
+        min_download_bytes: PROXY_VERIFY_LIMITS.min_download_bytes,
+        min_download_mbps: PROXY_VERIFY_LIMITS.min_download_mbps,
+        required_services: ['YouTube HTTPS /generate_204', 'Discord HTTPS /api/v10/gateway'],
+        service_policy: 'Both target TLS certificates must validate and both HTTP status codes must match expected success codes',
+        probe_location: 'Cloudflare Worker egress through VLESS tunnel, not Moscow',
+      },
     },
     stats: {
       candidate_endpoints: candidates,
@@ -1235,6 +1253,8 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       speed_test_bytes: node.functional_probe?.download_bytes ?? 0,
       download_mbps: node.functional_probe?.download_mbps ?? 0,
       verification_http_status: node.functional_probe?.http_status ?? null,
+      youtube: node.functional_probe?.services?.youtube || { ok: false, error: 'not checked' },
+      discord: node.functional_probe?.services?.discord || { ok: false, error: 'not checked' },
       verification_tested_at: node.functional_probe?.verified_at || null,
       uri: node.uri,
     })),
@@ -1297,7 +1317,24 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const verificationResults = await mapLimit(
     verificationJobs,
     VERIFIER_CONCURRENCY,
-    ({ config }) => verifyVlessProxy(config),
+    async ({ config }) => {
+      const proxyCheck = await verifyVlessProxy(config);
+      if (!proxyCheck?.ok) {
+        const skipped = {
+          youtube: { ok: false, service: 'youtube', error: proxyCheck?.error || 'Base proxy verification failed' },
+          discord: { ok: false, service: 'discord', error: proxyCheck?.error || 'Base proxy verification failed' },
+        };
+        return { ...proxyCheck, services: skipped, verifier: 'VLESS + download; service checks skipped after base failure' };
+      }
+      const services = await verifyVlessServices(config);
+      return {
+        ...proxyCheck,
+        ok: services.ok === true,
+        services: { youtube: services.youtube, discord: services.discord },
+        verifier: 'VLESS + download + YouTube HTTPS + Discord HTTPS',
+        error: services.ok ? null : services.error,
+      };
+    },
   );
   verificationResults.forEach((result, index) => {
     const job = verificationJobs[index];
@@ -1305,6 +1342,9 @@ async function runScanner(env, scheduledTime = Date.now()) {
   });
   const protocolPassed = verificationResults.filter((result) => result?.ok).length;
   const protocolUnsupported = verificationResults.filter((result) => result?.supported === false).length;
+  const youtubePassed = verificationResults.filter((result) => result?.services?.youtube?.ok === true).length;
+  const discordPassed = verificationResults.filter((result) => result?.services?.discord?.ok === true).length;
+  const serviceChecks = verificationResults.filter((result) => result?.services).length;
   const speedSamples = verificationResults.filter((result) => result?.ok && Number.isFinite(Number(result.download_mbps)));
   const averageDownloadMbps = speedSamples.length
     ? Number((speedSamples.reduce((sum, result) => sum + Number(result.download_mbps), 0) / speedSamples.length).toFixed(3))
@@ -1348,6 +1388,10 @@ async function runScanner(env, scheduledTime = Date.now()) {
     protocol_checks: verificationResults.length,
     protocol_passed: protocolPassed,
     protocol_unsupported: protocolUnsupported,
+    service_checks: serviceChecks,
+    youtube_passed: youtubePassed,
+    discord_passed: discordPassed,
+    services_fully_passed: verificationResults.filter((result) => result?.services?.youtube?.ok === true && result?.services?.discord?.ok === true).length,
     speed_test_bytes: downloadBytes,
     average_download_mbps: averageDownloadMbps,
     probe_results: results.map((result, index) => ({
@@ -1387,8 +1431,8 @@ export default {
         repository: REPO,
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
-        probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP MTR (5 packets/hop) + Yandex DNS A-record lookup per endpoint; separate HTTPS/TLS reachability test to Yandex DoH once per scan; VLESS tunnel and download from Worker egress' },
-        schedule: '15-minute scan; up to 30 endpoints; 2 Globalping measurements per endpoint + 1 Yandex DoH TLS check per scan; 244 measurements/hour max; VLESS auth + HTTP 200 + 256 KiB download >=1 Mbps from Worker egress',
+        probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP MTR + Yandex DNS from Moscow; VLESS authentication, download and HTTPS requests to YouTube and Discord through each proxy from Cloudflare Worker egress' },
+        schedule: '15-minute scan; up to 30 endpoints; 2 Globalping measurements per endpoint + 1 Yandex DoH TLS check per scan; 244 measurements/hour max; VLESS auth + 256 KiB download + YouTube HTTPS + Discord HTTPS through proxy',
         max_tests_per_hour: 240,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
