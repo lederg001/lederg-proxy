@@ -52,9 +52,6 @@ export function getVlessProbeSupport(node) {
     if (!['tcp', 'raw', 'ws'].includes(network)) return { supported: false, reason: `Transport ${network} is not verified by this checker` };
     if (!['none', 'tls'].includes(security)) return { supported: false, reason: `Security mode ${security} requires a dedicated verifier` };
     const sni = params.get('sni') || params.get('servername') || params.get('serverName') || node.host;
-    if (security === 'tls' && normalizedHost(sni) !== normalizedHost(node.host)) {
-      return { supported: false, reason: 'Worker TCP sockets cannot set a separate TLS SNI; endpoint SNI differs from host' };
-    }
     const wsHost = params.get('host') || node.host;
     if (network === 'ws' && !wsHost) return { supported: false, reason: 'WebSocket Host header is missing' };
     return {
@@ -309,6 +306,438 @@ export async function verifyVlessProxy(node, connectFn) {
   } finally {
     try { await socket?.close(); } catch { /* close errors do not change the test result */ }
   }
+}
+
+
+export const VLESS_SERVICE_PROBES = Object.freeze([
+  Object.freeze({
+    id: 'youtube',
+    hostname: 'www.youtube.com',
+    port: 443,
+    path: '/generate_204',
+    acceptedStatuses: [200, 204],
+  }),
+  Object.freeze({
+    id: 'discord',
+    hostname: 'discord.com',
+    port: 443,
+    path: '/api/v10/gateway',
+    acceptedStatuses: [200],
+  }),
+]);
+
+const SERVICE_TIMEOUT_MS = 9000;
+const SERVICE_HEADER_LIMIT = 32768;
+
+function appendUint8(left, right) {
+  const a = left || new Uint8Array(0);
+  const b = right instanceof Uint8Array ? right : new Uint8Array(right);
+  const result = new Uint8Array(a.length + b.length);
+  result.set(a, 0);
+  result.set(b, a.length);
+  return result;
+}
+
+class SocketByteReader {
+  constructor(socket) {
+    this.socket = socket;
+    this.buffer = new Uint8Array(0);
+    this.failure = null;
+    this.waiters = [];
+    this.onData = (chunk) => {
+      this.buffer = appendUint8(this.buffer, chunk);
+      for (const waiter of this.waiters.splice(0)) waiter.resolve();
+    };
+    this.onError = (error) => {
+      this.failure = error instanceof Error ? error : new Error(String(error));
+      for (const waiter of this.waiters.splice(0)) waiter.reject(this.failure);
+    };
+    this.onEnd = () => {
+      this.failure = new Error('Proxy tunnel closed before the response was complete');
+      for (const waiter of this.waiters.splice(0)) waiter.reject(this.failure);
+    };
+    socket.on('data', this.onData);
+    socket.on('error', this.onError);
+    socket.on('end', this.onEnd);
+    socket.resume?.();
+  }
+
+  async waitForData() {
+    if (this.failure) throw this.failure;
+    await new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
+    if (this.failure) throw this.failure;
+  }
+
+  async readExactly(length) {
+    if (!Number.isInteger(length) || length < 0 || length > SERVICE_HEADER_LIMIT) {
+      throw new Error('Invalid proxy response read length');
+    }
+    while (this.buffer.length < length) await this.waitForData();
+    const result = this.buffer.slice(0, length);
+    this.buffer = this.buffer.slice(length);
+    return result;
+  }
+
+  async readUntil(delimiter = '\r\n\r\n', maxBytes = SERVICE_HEADER_LIMIT) {
+    const marker = TEXT.encode(delimiter);
+    while (true) {
+      outer: for (let i = 0; i <= this.buffer.length - marker.length; i += 1) {
+        for (let j = 0; j < marker.length; j += 1) {
+          if (this.buffer[i + j] !== marker[j]) continue outer;
+        }
+        const end = i + marker.length;
+        if (end > maxBytes) throw new Error('Upstream HTTP response headers exceeded the size limit');
+        const result = this.buffer.slice(0, end);
+        this.buffer = this.buffer.slice(end);
+        return result;
+      }
+      if (this.buffer.length > maxBytes) throw new Error('Upstream HTTP response headers exceeded the size limit');
+      await this.waitForData();
+    }
+  }
+
+  detach() {
+    this.socket.pause?.();
+    this.socket.removeListener('data', this.onData);
+    this.socket.removeListener('error', this.onError);
+    this.socket.removeListener('end', this.onEnd);
+    if (this.buffer.length) {
+      this.socket.unshift?.(this.buffer);
+      this.buffer = new Uint8Array(0);
+    }
+  }
+}
+
+function waitForSocketEvent(socket, eventName, timeoutMs, timeoutMessage) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeListener(eventName, onSuccess);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+    };
+    const onSuccess = (...args) => { cleanup(); resolve(args[0]); };
+    const onError = (error) => { cleanup(); reject(error instanceof Error ? error : new Error(String(error))); };
+    const onClose = () => { cleanup(); reject(new Error('Socket closed before ' + eventName)); };
+    socket.once(eventName, onSuccess);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+    timer = setTimeout(() => { cleanup(); reject(new Error(timeoutMessage)); }, timeoutMs);
+  });
+}
+
+function writeSocket(socket, bytes) {
+  return new Promise((resolve, reject) => {
+    socket.write(bytes, (error) => error ? reject(error) : resolve());
+  });
+}
+
+function parseHttpResponseHead(bytes) {
+  const text = new TextDecoder().decode(bytes);
+  const lines = text.split('\r\n');
+  const firstLine = lines.shift() || '';
+  const match = firstLine.match(/^HTTP\/1\.[01]\s+(\d{3})\b/i);
+  if (!match) throw new Error('Target service did not return a valid HTTP response');
+  const headers = {};
+  for (const line of lines) {
+    const index = line.indexOf(':');
+    if (index > 0) headers[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
+  }
+  return { status: Number(match[1]), headers };
+}
+
+function isIpLiteral(host) {
+  const value = normalizedHost(host);
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value) || value.includes(':');
+}
+
+function buildVlessConnectHeader(uri, targetHost, targetPort = 443) {
+  const url = new URL(uri);
+  const uuid = decodeURIComponent(url.username).replace(/-/g, '');
+  if (!/^[0-9a-f]{32}$/i.test(uuid)) throw new Error('Invalid VLESS UUID');
+  const uuidBytes = Uint8Array.from(uuid.match(/.{2}/g), (pair) => Number.parseInt(pair, 16));
+  const hostBytes = TEXT.encode(targetHost);
+  if (hostBytes.length < 1 || hostBytes.length > 255) throw new Error('Invalid target hostname length');
+  const port = Number(targetPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid target port');
+  return concatBytes(
+    new Uint8Array([0]),
+    uuidBytes,
+    new Uint8Array([0, 1, (port >> 8) & 0xff, port & 0xff, 2, hostBytes.length]),
+    hostBytes,
+  );
+}
+
+function buildWebSocketRequest(support, port) {
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const key = base64(nonce);
+  const request = [
+    `GET ${support.path} HTTP/1.1`,
+    `Host: ${support.wsHost}${port === 443 || port === 80 ? '' : `:${port}`}`,
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    `Sec-WebSocket-Key: ${key}`,
+    'Sec-WebSocket-Version: 13',
+    'User-Agent: LEDERG-Proxy-Health/1.0',
+    '',
+    '',
+  ].join('\r\n');
+  return { request: TEXT.encode(request), key };
+}
+
+async function validateWebSocketUpgrade(socket, support, port) {
+  const { request, key } = buildWebSocketRequest(support, port);
+  await writeSocket(socket, request);
+  const reader = new SocketByteReader(socket);
+  const headerBytes = await timeout(
+    reader.readUntil(),
+    SERVICE_TIMEOUT_MS,
+    'WebSocket upgrade timed out',
+  );
+  reader.detach();
+  const header = new TextDecoder().decode(headerBytes);
+  if (!/^HTTP\/1\.[01] 101\b/im.test(header)) {
+    throw new Error(`VLESS WebSocket upgrade rejected: ${header.split('\r\n')[0] || 'no HTTP status'}`);
+  }
+  const accept = header.match(/^sec-websocket-accept:\s*(.+)$/im)?.[1]?.trim();
+  const digest = await crypto.subtle.digest(
+    'SHA-1',
+    TEXT.encode(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'),
+  );
+  if (accept !== base64(new Uint8Array(digest))) throw new Error('Invalid WebSocket Sec-WebSocket-Accept');
+}
+
+function createWebSocketDuplex(socket, Duplex) {
+  let incoming = new Uint8Array(0);
+  let closed = false;
+  let stream;
+  const onData = (chunk) => {
+    incoming = appendUint8(incoming, chunk);
+    parseFrames();
+  };
+  const onError = (error) => stream?.destroy(error);
+  const onEnd = () => {
+    if (!closed) {
+      closed = true;
+      stream?.push(null);
+    }
+  };
+  const parseFrames = () => {
+    while (incoming.length >= 2 && !closed) {
+      const first = incoming[0];
+      const second = incoming[1];
+      const opcode = first & 0x0f;
+      const masked = Boolean(second & 0x80);
+      let length = second & 0x7f;
+      let offset = 2;
+      if (length === 126) {
+        if (incoming.length < 4) return;
+        length = (incoming[2] << 8) | incoming[3];
+        offset = 4;
+      } else if (length === 127) {
+        if (incoming.length < 10) return;
+        const high = new DataView(incoming.buffer, incoming.byteOffset + 2, 8).getUint32(0);
+        const low = new DataView(incoming.buffer, incoming.byteOffset + 2, 8).getUint32(4);
+        if (high !== 0 || low > 1024 * 1024) {
+          stream.destroy(new Error('WebSocket frame exceeds the TLS probe limit'));
+          return;
+        }
+        length = low;
+        offset = 10;
+      }
+      const maskLength = masked ? 4 : 0;
+      if (length > 1024 * 1024 || incoming.length < offset + maskLength + length) return;
+      const mask = masked ? incoming.slice(offset, offset + 4) : null;
+      const payloadStart = offset + maskLength;
+      const payload = incoming.slice(payloadStart, payloadStart + length);
+      incoming = incoming.slice(payloadStart + length);
+      if (mask) for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4];
+      if (opcode === 8) {
+        closed = true;
+        stream.push(null);
+        return;
+      }
+      if (opcode === 9) {
+        socket.write(makeWebSocketFrame(payload, 10));
+        continue;
+      }
+      if (opcode === 10) continue;
+      if (opcode === 1 || opcode === 2 || opcode === 0) {
+        if (!stream.push(payload)) return;
+      }
+    }
+  };
+  stream = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      socket.write(makeWebSocketFrame(new Uint8Array(chunk)), callback);
+    },
+    final(callback) { callback(); },
+    destroy(error, callback) {
+      socket.removeListener('data', onData);
+      socket.removeListener('error', onError);
+      socket.removeListener('end', onEnd);
+      callback(error);
+    },
+  });
+  socket.on('data', onData);
+  socket.on('error', onError);
+  socket.on('end', onEnd);
+  socket.resume?.();
+  return stream;
+}
+
+async function verifyVlessService(node, service, dependencies = {}) {
+  let rawSocket;
+  let proxySocket;
+  let tunnelSocket;
+  let serviceTls;
+  let websocketStream;
+  const startedAt = performance.now();
+  try {
+    const support = getVlessProbeSupport(node);
+    if (!support.supported) return { ok: false, service: service.id, error: support.reason };
+    const netModule = dependencies.net || await import('node:net');
+    const tlsModule = dependencies.tls || await import('node:tls');
+    const streamModule = dependencies.stream || await import('node:stream');
+    const connect = dependencies.connect || netModule.connect;
+    const tlsConnect = dependencies.tlsConnect || tlsModule.connect;
+    const Duplex = dependencies.Duplex || streamModule.Duplex;
+
+    rawSocket = connect({ host: node.host, port: node.port });
+    await timeout(
+      waitForSocketEvent(rawSocket, 'connect', SERVICE_TIMEOUT_MS, 'TCP connection to the VLESS server timed out'),
+      SERVICE_TIMEOUT_MS + 100,
+      'TCP connection to the VLESS server timed out',
+    );
+    const connectedAt = performance.now();
+    proxySocket = rawSocket;
+
+    if (support.security === 'tls') {
+      const outerOptions = {
+        socket: rawSocket,
+        rejectUnauthorized: true,
+        ALPNProtocols: ['http/1.1'],
+        ...(support.sni ? { servername: support.sni } : {}),
+        ...(support.sni ? { host: support.sni } : {}),
+      };
+      proxySocket = tlsConnect(outerOptions);
+      await timeout(
+        waitForSocketEvent(proxySocket, 'secureConnect', SERVICE_TIMEOUT_MS, 'TLS to the VLESS server timed out'),
+        SERVICE_TIMEOUT_MS + 100,
+        'TLS to the VLESS server timed out',
+      );
+      if (proxySocket.authorized === false) throw new Error('TLS certificate for the VLESS server is not trusted');
+    }
+
+    if (support.network === 'ws') {
+      await validateWebSocketUpgrade(proxySocket, support, node.port);
+      websocketStream = createWebSocketDuplex(proxySocket, Duplex);
+      tunnelSocket = websocketStream;
+    } else {
+      tunnelSocket = proxySocket;
+    }
+
+    await writeSocket(tunnelSocket, buildVlessConnectHeader(node.uri, service.hostname, service.port));
+    const vlessReader = new SocketByteReader(tunnelSocket);
+    const responseHeader = await timeout(
+      vlessReader.readExactly(2),
+      SERVICE_TIMEOUT_MS,
+      'VLESS target connection timed out',
+    );
+    if (responseHeader[0] !== 0) throw new Error('The proxy did not return a valid VLESS response');
+    if (responseHeader[1] > 0) await timeout(
+      vlessReader.readExactly(responseHeader[1]),
+      SERVICE_TIMEOUT_MS,
+      'VLESS response addons timed out',
+    );
+    vlessReader.detach();
+
+    const tlsStartedAt = performance.now();
+    serviceTls = tlsConnect({
+      socket: tunnelSocket,
+      host: service.hostname,
+      servername: service.hostname,
+      rejectUnauthorized: true,
+      ALPNProtocols: ['http/1.1'],
+    });
+    await timeout(
+      waitForSocketEvent(serviceTls, 'secureConnect', SERVICE_TIMEOUT_MS, `TLS to ${service.id} timed out through proxy`),
+      SERVICE_TIMEOUT_MS + 100,
+      `TLS to ${service.id} timed out through proxy`,
+    );
+    const tlsFinishedAt = performance.now();
+    if (serviceTls.authorized === false) {
+      throw new Error(`TLS certificate for ${service.id} was not trusted: ${serviceTls.authorizationError || 'unknown error'}`);
+    }
+
+    const request = [
+      `GET ${service.path} HTTP/1.1`,
+      `Host: ${service.hostname}`,
+      'User-Agent: LEDERG-Proxy-Health/1.0',
+      'Accept: */*',
+      'Connection: close',
+      '',
+      '',
+    ].join('\r\n');
+    const responseStartedAt = performance.now();
+    await writeSocket(serviceTls, TEXT.encode(request));
+    const responseReader = new SocketByteReader(serviceTls);
+    const responseBytes = await timeout(
+      responseReader.readUntil(),
+      SERVICE_TIMEOUT_MS,
+      `HTTP response from ${service.id} timed out through proxy`,
+    );
+    responseReader.detach();
+    const response = parseHttpResponseHead(responseBytes);
+    const completedAt = performance.now();
+    const ok = service.acceptedStatuses.includes(response.status);
+    return {
+      ok,
+      service: service.id,
+      probe_location: 'Cloudflare Worker egress through VLESS tunnel (not Moscow)',
+      connect_ms: Math.round(connectedAt - startedAt),
+      tls_ms: Math.round(tlsFinishedAt - tlsStartedAt),
+      response_ms: Math.round(completedAt - responseStartedAt),
+      total_ms: Math.round(completedAt - startedAt),
+      http_status: response.status,
+      tls_authorized: serviceTls.authorized !== false,
+      tls_protocol: serviceTls.getProtocol?.() || null,
+      alpn: serviceTls.alpnProtocol || null,
+      target: `https://${service.hostname}${service.path}`,
+      error: ok ? null : `${service.id} returned HTTP ${response.status}`,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      service: service.id,
+      probe_location: 'Cloudflare Worker egress through VLESS tunnel (not Moscow)',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    try { serviceTls?.destroy(); } catch { /* best-effort socket cleanup */ }
+    try { websocketStream?.destroy(); } catch { /* best-effort socket cleanup */ }
+    try { proxySocket?.destroy(); } catch { /* best-effort socket cleanup */ }
+    if (rawSocket !== proxySocket) {
+      try { rawSocket?.destroy(); } catch { /* best-effort socket cleanup */ }
+    }
+  }
+}
+
+export async function verifyVlessServices(node, probeService = verifyVlessService) {
+  const results = await Promise.all(
+    VLESS_SERVICE_PROBES.map((service) => probeService(node, service)),
+  );
+  const indexed = Object.fromEntries(results.map((result, index) => [VLESS_SERVICE_PROBES[index].id, result]));
+  const ok = VLESS_SERVICE_PROBES.every((service) => indexed[service.id]?.ok === true);
+  const failed = VLESS_SERVICE_PROBES.filter((service) => indexed[service.id]?.ok !== true);
+  return {
+    ok,
+    youtube: indexed.youtube || { ok: false, error: 'YouTube probe did not return a result' },
+    discord: indexed.discord || { ok: false, error: 'Discord probe did not return a result' },
+    error: ok ? null : failed.map((service) => indexed[service.id]?.error || `${service.id} check failed`).join('; '),
+  };
 }
 
 export const PROXY_VERIFY_LIMITS = Object.freeze({
