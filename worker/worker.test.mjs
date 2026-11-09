@@ -135,9 +135,9 @@ test('uses only non-Cloudflare DoH resolvers and bootstraps their hostnames', ()
 
   assert.deepEqual(dns.servers, [
     'https://common.dot.dns.yandex.net/dns-query',
-    'https://dns.google/dns-query',
     'https://unfiltered.adguard-dns.com/dns-query',
     'https://dns10.quad9.net/dns-query',
+    'https://dns.google/dns-query',
   ]);
   assert.deepEqual(dns.hosts['common.dot.dns.yandex.net'], ['77.88.8.8', '77.88.8.1']);
   assert.deepEqual(dns.hosts['dns.google'], ['8.8.8.8', '8.8.4.4']);
