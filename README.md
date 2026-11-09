@@ -20,7 +20,7 @@ Add one subscription URL to HAPP. The JSON output includes resolver and transpor
 - Ranking uses median Moscow latency, RTT spread (jitter), packet loss and recent reliability.
 - A node is only published after at least two successful Moscow measurements, at least 80% recent reliability, and two consecutive recent successes.
 - Two consecutive failures remove it from the active set.
-- The pool is capped at 30 unique TCP endpoints. Two endpoints are selected per minute, and each receives two independent Moscow TCP measurements in parallel: 4 tests/minute, 240 tests/hour, and a 15-minute full sweep (below Globalping's unauthenticated 250 tests/hour limit).
+- The full verifier currently publishes only VLESS nodes using TCP, RAW or WebSocket transports and compatible security settings; VMess, Trojan, Shadowsocks, SOCKS and Hysteria2 remain excluded until their own end-to-end verifiers are implemented. The pool is capped at 30 unique TCP endpoints. Two endpoints are selected per minute, and each receives two independent Moscow TCP measurements in parallel: 4 tests/minute, 240 tests/hour, and a 15-minute full sweep (below Globalping's unauthenticated 250 tests/hour limit).
 - This is a TCP availability/routing measurement, not a full protocol authentication or throughput test. UDP-only Hysteria2 nodes are excluded from the Moscow TCP pool.
 
 ## DNS and TLS profile settings
