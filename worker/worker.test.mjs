@@ -560,6 +560,27 @@ test('rejects the Yandex DoH path when the Moscow TLS handshake is not trusted',
   assert.match(parsed.error, /TLS/i);
 });
 
+test('preserves a running Globalping check as pending instead of converting it to no-probe failure', () => {
+  const parsed = parseGlobalpingMtrResult({
+    pending: true,
+    error: 'Moscow MTR measurement did not finish within the polling window',
+  }, 'proxy.example.net');
+  assert.equal(parsed.pending, true);
+  assert.match(parsed.error, /did not finish/i);
+});
+
+test('does not record an incomplete MTR and DNS pair as a completed failure sample', async () => {
+  const paired = await probeMoscowPair(
+    { host: 'proxy.example.net', port: 443 },
+    async (_endpoint, type) => type === 'mtr'
+      ? { pending: true, error: 'MTR still running' }
+      : { ok: true, query_ms: 20, answer_count: 1, provider: 'Yandex DNS (77.88.8.8)' },
+  );
+  assert.equal(paired.pending, true);
+  assert.equal(paired.measurements_completed, 1);
+  assert.equal(paired.samples.length, 0);
+});
+
 test('publishes a HAPP subscription with supported standard profile settings only', () => {
   const subscription = renderHappSubscription([{
     uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp',
