@@ -12,10 +12,10 @@ const STATE_KEY = 'scanner-state-v1';
 const FEED_TTL_MS = 9 * 60 * 1000;
 const FEED_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_SOURCE_BYTES = 768 * 1024;
-const MAX_POOL_ENDPOINTS = 60;
+const MAX_POOL_ENDPOINTS = 45;
 const MAX_CONFIGS_PER_FEED = 120;
-const CHECKS_PER_RUN = 4;
-const PROBE_CONCURRENCY = 4;
+const CHECKS_PER_RUN = 3;
+const PROBE_CONCURRENCY = 3;
 const ACTIVE_TTL_MS = 35 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 
@@ -570,7 +570,7 @@ export function evaluateMoscowHistory(samples) {
     consecutive_successes: consecutiveSuccesses,
     consecutive_failures: consecutiveFailures,
     score,
-    available: successCount > 0 && reliability >= 66 && consecutiveFailures < 2,
+    available: successCount >= 2 && reliability >= 80 && consecutiveSuccesses >= 2 && consecutiveFailures < 2,
   };
 }
 
@@ -677,8 +677,8 @@ export function buildMoscowDnsConfig() {
   return {
     hosts: {
       'common.dot.dns.yandex.net': '77.88.8.8',
-      'dns.adguard-dns.com': '94.140.14.14',
-      'dns.quad9.net': '9.9.9.9',
+      'dns.adguard-dns.com': ['94.140.14.14', '94.140.15.15'],
+      'dns.quad9.net': ['9.9.9.9', '149.112.112.112'],
       'dns.google': ['8.8.8.8', '8.8.4.4'],
     },
     servers: [...MOSCOW_DNS_SERVERS],
@@ -743,6 +743,10 @@ function parseVmessConfig(uri) {
   try { return JSON.parse(decoded); } catch { return null; }
 }
 
+function isRealityCompatibleTransport(network) {
+  return ['tcp', 'raw', 'xhttp', 'grpc'].includes(String(network || 'tcp').toLowerCase());
+}
+
 function createXrayOutbound(node) {
   const protocol = String(node.protocol || '').toLowerCase();
   const uri = String(node.uri || '');
@@ -753,6 +757,7 @@ function createXrayOutbound(node) {
     const params = url.searchParams;
     const security = params.get('security') || 'none';
     const network = params.get('type') || params.get('network') || 'tcp';
+    if (security === 'reality' && !isRealityCompatibleTransport(network)) return null;
     const user = { id, encryption: params.get('encryption') || 'none' };
     const flow = params.get('flow');
     if (flow) user.flow = flow;
@@ -792,6 +797,7 @@ function createXrayOutbound(node) {
     const params = url.searchParams;
     const security = params.get('security') || 'tls';
     const network = params.get('type') || params.get('network') || 'tcp';
+    if (security === 'reality' && !isRealityCompatibleTransport(network)) return null;
     return {
       tag: 'proxy', protocol: 'trojan',
       settings: { servers: [{ address: node.host, port: node.port, password }] },
@@ -1004,8 +1010,8 @@ export default {
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
         probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping' },
-        schedule: '* * * * * UTC; 4 Moscow TCP measurements per minute; 60 candidates per 15-minute sweep; 240 tests/hour max',
-        max_tests_per_hour: 240,
+        schedule: '* * * * * UTC; 3 Moscow TCP measurements per minute; 45 candidates per 15-minute sweep; 180 tests/hour max',
+        max_tests_per_hour: 180,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
       }, { headers: { 'cache-control': 'no-store' } });
