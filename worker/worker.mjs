@@ -1,4 +1,4 @@
-import { getVlessProbeSupport, verifyVlessProxy } from './proxy-verifier.mjs';
+import { getVlessProbeSupport, PROXY_VERIFY_LIMITS, verifyVlessProxy } from './proxy-verifier.mjs';
 
 const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
@@ -1005,7 +1005,7 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       country: MOSCOW_COUNTRY,
       method: 'Globalping TCP ping (3 packets) from Moscow, RU; separate VLESS authentication, tunneled HTTP and download test from Cloudflare Worker egress',
       meaning: 'Moscow measurement confirms TCP reachability and RTT only. A profile is published only after a separate VLESS protocol response, HTTP 200 through the proxy, and a 64 KiB download speed test from Cloudflare Worker egress.',
-      functional_verification: { protocol: 'VLESS', transports: ['TCP', 'RAW', 'WebSocket'], security: ['none', 'TLS when endpoint SNI matches host'], min_download_bytes: 65536, min_download_mbps: 0.2, probe_location: 'Cloudflare Worker egress, not Moscow' },
+      functional_verification: { protocol: 'VLESS', transports: ['TCP', 'RAW', 'WebSocket'], security: ['none', 'TLS when endpoint SNI matches host'], min_download_bytes: PROXY_VERIFY_LIMITS.min_download_bytes, min_download_mbps: PROXY_VERIFY_LIMITS.min_download_mbps, probe_location: 'Cloudflare Worker egress, not Moscow' },
     },
     stats: {
       candidate_endpoints: candidates,
@@ -1191,7 +1191,7 @@ export default {
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
         probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping + separate VLESS tunnel and speed test from Cloudflare Worker egress' },
-        schedule: '* * * * * UTC; Moscow paired TCP checks + authenticated VLESS tunnel and 64 KiB HTTP download; 30 candidates per 15-minute sweep; 240 Globalping tests/hour max',
+        schedule: '* * * * * UTC; Moscow paired TCP checks + authenticated VLESS tunnel and 256 KiB HTTP download at >=1 Mbps; 30 candidates per 15-minute sweep; 240 Globalping tests/hour max',
         max_tests_per_hour: 240,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
