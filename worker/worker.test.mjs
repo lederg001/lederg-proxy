@@ -23,12 +23,42 @@ import {
 import {
   buildVlessProbeRequest,
   buildWorkerTlsOptions,
+  SocketByteReader,
   getVlessProbeSupport,
   verifyVlessProxy,
   verifyVlessServices,
   VLESS_SERVICE_PROBES,
   PROXY_VERIFY_LIMITS,
 } from './proxy-verifier.mjs';
+
+test('detaches a TCP socket reader without pausing a locked Workers stream', () => {
+  const listeners = new Map();
+  let pauseCalls = 0;
+  const socket = {
+    on(event, handler) {
+      const values = listeners.get(event) || [];
+      values.push(handler);
+      listeners.set(event, values);
+      return this;
+    },
+    removeListener(event, handler) {
+      listeners.set(event, (listeners.get(event) || []).filter((value) => value !== handler));
+      return this;
+    },
+    resume() { return this; },
+    pause() {
+      pauseCalls += 1;
+      throw new Error('Cannot call releaseLock() on a reader with outstanding read promises.');
+    },
+    unshift() { return this; },
+  };
+  const reader = new SocketByteReader(socket);
+  assert.doesNotThrow(() => reader.detach());
+  assert.equal(pauseCalls, 0);
+  assert.equal((listeners.get('data') || []).length, 0);
+  assert.equal((listeners.get('error') || []).length, 0);
+  assert.equal((listeners.get('end') || []).length, 0);
+});
 
 test('builds TLS options supported by Cloudflare Workers without unsupported ALPNProtocols', () => {
   const options = buildWorkerTlsOptions({
