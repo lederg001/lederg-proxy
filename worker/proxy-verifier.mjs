@@ -343,7 +343,7 @@ function appendUint8(left, right) {
   return result;
 }
 
-class SocketByteReader {
+export class SocketByteReader {
   constructor(socket) {
     this.socket = socket;
     this.buffer = new Uint8Array(0);
@@ -414,10 +414,17 @@ class SocketByteReader {
   }
 
   detach() {
-    this.socket.pause?.();
+    // Do not call pause(): Workers' node:net adapter may still have an
+    // outstanding Web Streams read, and pause() tries to release its lock.
     this.socket.removeListener('data', this.onData);
     this.socket.removeListener('error', this.onError);
     this.socket.removeListener('end', this.onEnd);
+
+    if (this.waiters.length) {
+      this.failure ||= new Error('Proxy socket reader detached');
+      for (const waiter of this.waiters.splice(0)) waiter.reject(this.failure);
+    }
+
     if (this.buffer.length) {
       this.socket.unshift?.(this.buffer);
       this.buffer = new Uint8Array(0);
