@@ -17,6 +17,7 @@ import {
   buildVlessProbeRequest,
   getVlessProbeSupport,
   verifyVlessProxy,
+  PROXY_VERIFY_LIMITS,
 } from './proxy-verifier.mjs';
 
 test('accepts a TCP ping from a Moscow, RU probe using Globalping measurement response shape', () => {
@@ -425,4 +426,11 @@ test('selects only VLESS configs with a supported full-verification transport', 
     { protocol: 'trojan', uri: 'trojan://password@proxy.example.net:443', host: 'proxy.example.net', port: 443 },
   ];
   assert.deepEqual(selectVerifiableConfigs(configs, 3), [configs[2]]);
+});
+
+
+test('requires a meaningful end-to-end download sample and minimum speed', () => {
+  assert.equal(PROXY_VERIFY_LIMITS.min_download_bytes, 256 * 1024);
+  assert.equal(PROXY_VERIFY_LIMITS.min_download_mbps, 1);
+  assert.equal(PROXY_VERIFY_LIMITS.supported_protocols.includes('VLESS'), true);
 });
