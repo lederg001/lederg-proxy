@@ -265,20 +265,19 @@ export async function verifyVlessProxy(node, dependencies = {}) {
     }
 
     let bytes = 0;
-    let firstByteAt = 0;
-    const downloadStartedAt = performance.now();
-    while (bytes < MIN_DOWNLOAD_BYTES && performance.now() - downloadStartedAt < DOWNLOAD_TIMEOUT_MS) {
+    while (bytes < MIN_DOWNLOAD_BYTES && performance.now() - responseStartedAt < DOWNLOAD_TIMEOUT_MS) {
       const chunk = await timeout(
         reader.readSome(),
-        Math.max(1000, DOWNLOAD_TIMEOUT_MS - (performance.now() - downloadStartedAt)),
+        Math.max(1000, DOWNLOAD_TIMEOUT_MS - (performance.now() - responseStartedAt)),
         'Download stalled through proxy',
       );
       if (!chunk?.length) break;
-      if (!firstByteAt) firstByteAt = performance.now();
       bytes += chunk.length;
     }
     const finishedAt = performance.now();
-    const transferMs = Math.max(1, finishedAt - (firstByteAt || downloadStartedAt));
+    // Measure from request write through complete body receipt; this avoids
+    // overstating speed when headers and body arrive in the same TCP chunk.
+    const transferMs = Math.max(1, finishedAt - responseStartedAt);
     const downloadMbps = Number(((bytes * 8) / (transferMs / 1000) / 1_000_000).toFixed(3));
     if (bytes < MIN_DOWNLOAD_BYTES) {
       throw new Error(`Proxy tunnel delivered only ${bytes} bytes; minimum is ${MIN_DOWNLOAD_BYTES}`);
