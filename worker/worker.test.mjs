@@ -3,61 +3,90 @@ import assert from 'node:assert/strict';
 import {
   calculateSweepMinutes,
   decodeMaybeBase64,
+  evaluateMoscowHistory,
+  parseGlobalpingTcpResult,
   parseProxyUri,
-  probeTcpSocket,
 } from './worker.mjs';
 
-test('probes a reachable TCP endpoint and closes the socket', async () => {
-  let closed = false;
-  const result = await probeTcpSocket(
-    { host: 'proxy.example.net', port: 443 },
-    (address, options) => {
-      assert.deepEqual(address, { hostname: 'proxy.example.net', port: 443 });
-      assert.deepEqual(options, { secureTransport: 'off', allowHalfOpen: false });
-      return {
-        opened: Promise.resolve({ remoteAddress: '203.0.113.10' }),
-        close() { closed = true; },
-      };
-    },
-  );
-  assert.equal(result.ok, true);
-  assert.equal(Number.isFinite(result.latency_ms), true);
-  assert.equal(result.address, '203.0.113.10');
-  assert.equal(closed, true);
+test('accepts a TCP ping only when the reporting probe is in Moscow, Russia', () => {
+  const parsed = parseGlobalpingTcpResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU', network: 'Example ISP', asn: 12345 },
+      result: {
+        status: 'finished',
+        stats: { min: 42, avg: 45, max: 50, total: 3, rcv: 3, drop: 0, loss: 0 },
+      },
+    }],
+  });
+
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.latency_ms, 45);
+  assert.equal(parsed.jitter_ms, 8);
+  assert.equal(parsed.loss_pct, 0);
+  assert.equal(parsed.probe_location, 'Moscow');
+  assert.equal(parsed.network, 'Example ISP');
 });
 
-test('reports TCP connect errors and closes failed sockets', async () => {
-  let closed = false;
-  const result = await probeTcpSocket(
-    { host: 'proxy.example.net', port: 443 },
-    () => ({
-      opened: Promise.reject(new Error('Connection refused')),
-      close() { closed = true; },
-    }),
-  );
-  assert.deepEqual(result, { ok: false, error: 'Connection refused' });
-  assert.equal(closed, true);
+test('never accepts a successful probe from a non-Moscow location', () => {
+  const parsed = parseGlobalpingTcpResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Amsterdam', country: 'NL' },
+      result: { status: 'finished', stats: { min: 4, avg: 5, max: 6, total: 3, rcv: 3, loss: 0 } },
+    }],
+  });
+
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /Moscow/i);
 });
 
-test('times out a stalled TCP handshake', async () => {
-  let closed = false;
-  const result = await probeTcpSocket(
-    { host: 'proxy.example.net', port: 443 },
-    () => ({
-      opened: new Promise(() => {}),
-      close() { closed = true; },
-    }),
-    5,
-  );
-  assert.deepEqual(result, { ok: false, error: 'TCP connect timeout' });
-  assert.equal(closed, true);
+test('keeps unfinished Moscow measurements pending rather than marking them offline', () => {
+  assert.deepEqual(parseGlobalpingTcpResult({ status: 'in-progress', results: [] }), {
+    pending: true,
+    error: 'Moscow measurement is still in progress',
+  });
 });
 
-test('does not claim success when the runtime socket connector is missing', async () => {
-  assert.deepEqual(
-    await probeTcpSocket({ host: 'proxy.example.net', port: 443 }, null),
-    { ok: false, error: 'Cloudflare TCP socket connector is unavailable' },
-  );
+test('rejects a Moscow TCP test with severe packet loss', () => {
+  const parsed = parseGlobalpingTcpResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU' },
+      result: {
+        status: 'finished',
+        stats: { min: 80, avg: 120, max: 200, total: 3, rcv: 1, drop: 2, loss: 66.7 },
+      },
+    }],
+  });
+
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.loss_pct, 66.7);
+});
+
+test('scores Moscow samples by median latency, jitter, and reliability', () => {
+  const quality = evaluateMoscowHistory([
+    { ok: true, latency_ms: 80, jitter_ms: 10, loss_pct: 0 },
+    { ok: true, latency_ms: 100, jitter_ms: 20, loss_pct: 0 },
+    { ok: false, error: 'timeout' },
+  ]);
+
+  assert.equal(quality.latency_ms, 90);
+  assert.equal(quality.jitter_ms, 15);
+  assert.equal(quality.reliability_pct, 67);
+  assert.equal(quality.available, true);
+  assert.equal(Number.isFinite(quality.score), true);
+});
+
+test('marks a Moscow endpoint unavailable after two consecutive failed checks', () => {
+  const quality = evaluateMoscowHistory([
+    { ok: true, latency_ms: 40, jitter_ms: 5, loss_pct: 0 },
+    { ok: false, error: 'timeout' },
+    { ok: false, error: 'connection refused' },
+  ]);
+
+  assert.equal(quality.available, false);
+  assert.equal(quality.consecutive_failures, 2);
 });
 
 test('decodes base64 GitHub subscription source files', () => {
@@ -73,8 +102,8 @@ test('parses a public VLESS config and rejects a private endpoint', () => {
   assert.equal(invalid, null);
 });
 
-test('a 300-endpoint pool is fully pinged within a 15-minute rotation', () => {
-  assert.equal(calculateSweepMinutes(300, 20), 15);
-  assert.equal(calculateSweepMinutes(301, 20), 16);
-  assert.equal(calculateSweepMinutes(0, 20), 0);
+test('keeps a 60-endpoint Moscow scan within 15 minutes and 240 checks per hour', () => {
+  assert.equal(calculateSweepMinutes(60, 4), 15);
+  assert.equal(calculateSweepMinutes(61, 4), 16);
+  assert.equal(calculateSweepMinutes(0, 4), 0);
 });
