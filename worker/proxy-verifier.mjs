@@ -293,7 +293,7 @@ export async function verifyVlessProxy(node, dependencies = {}) {
       probe_location: 'Cloudflare Worker egress through VLESS tunnel (not Moscow)',
       connect_ms: Number.isFinite(Number(tunnel.connect_ms))
         ? Number(tunnel.connect_ms)
-        : Math.round((tunnel.connectedAt || startedAt) - startedAt),
+        : Math.max(0, Math.round((tunnel.connectedAt || startedAt) - startedAt)),
       tunnel_ms: Math.round(finishedAt - startedAt),
       download_ms: Math.round(transferMs),
       download_bytes: bytes,
@@ -745,7 +745,7 @@ async function verifyVlessService(node, service, dependencies = {}) {
       ok,
       service: service.id,
       probe_location: 'Cloudflare Worker egress through VLESS tunnel (not Moscow)',
-      connect_ms: tunnel.connect_ms ?? Math.round(tunnel.connectedAt - startedAt),
+      connect_ms: tunnel.connect_ms ?? Math.max(0, Math.round(tunnel.connectedAt - startedAt)),
       tls_ms: Math.round(tlsFinishedAt - tlsStartedAt),
       response_ms: Math.round(completedAt - responseStartedAt),
       total_ms: Math.round(completedAt - startedAt),
