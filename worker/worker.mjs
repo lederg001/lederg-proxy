@@ -4,8 +4,8 @@ const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
 const GLOBALPING_API = 'https://api.globalping.io/v1';
 const GLOBALPING_REQUEST_TIMEOUT_MS = 9000;
-const GLOBALPING_POLL_ATTEMPTS = 40;
-const GLOBALPING_POLL_DELAY_MS = 500;
+const GLOBALPING_POLL_ATTEMPTS = 3;
+const GLOBALPING_POLL_DELAY_MS = 3000;
 const HISTORY_SIZE = 5;
 const MOSCOW_CITY = 'Moscow';
 const MOSCOW_COUNTRY = 'RU';
@@ -16,10 +16,10 @@ const FEED_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_SOURCE_BYTES = 768 * 1024;
 const MAX_POOL_ENDPOINTS = 30;
 const MAX_CONFIGS_PER_FEED = 120;
-const SCHEDULE_INTERVAL_MINUTES = 15;
-const CHECKS_PER_RUN = MAX_POOL_ENDPOINTS;
-const PROBE_CONCURRENCY = 6;
-const VERIFIER_CONCURRENCY = 8;
+const SCHEDULE_INTERVAL_MINUTES = 2;
+const CHECKS_PER_RUN = 5;
+const PROBE_CONCURRENCY = 2;
+const VERIFIER_CONCURRENCY = 2;
 const ACTIVE_TTL_MS = 35 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 
@@ -1202,8 +1202,8 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       provider: 'Globalping community probes',
       city: MOSCOW_CITY,
       country: MOSCOW_COUNTRY,
-      method: 'Globalping TCP MTR (5 packets/hop) to the proxy port and Yandex DNS A-record lookup (77.88.8.8/UDP) per Moscow proxy probe; a separate HTTPS/TLS reachability check to the Yandex DoH hostname each scan; full VLESS tunnel and download from Cloudflare Worker egress',
-      meaning: 'Moscow MTR must reach the proxy endpoint with at least 80% replies, no more than 20% loss and RTT <=450ms. Yandex DNS must return an A-record for the proxy hostname. A separate Moscow HTTPS test validates the Yandex DoH TLS endpoint. Full VLESS authentication, HTTP 200 and download speed are additionally verified from Cloudflare Worker egress, not Moscow.',
+      method: 'Six five-endpoint batches per 15-minute cycle. Each Moscow endpoint receives TCP MTR (5 packets/hop) and Yandex DNS A-record validation; Yandex DoH HTTPS/TLS baseline runs once per hour. VLESS tunnel, download and YouTube/Discord HTTPS checks run through each proxy from Cloudflare Worker egress',
+      meaning: 'The full 30-endpoint pool is covered in six batches over 12 minutes, then the cycle restarts every 15 minutes. Moscow MTR must reach the proxy endpoint with at least 80% replies, no more than 20% loss and RTT <=450ms. Yandex DNS must return an A-record. VLESS authentication, HTTP 200 download, YouTube and Discord are checked through the proxy from Worker egress, not Moscow.',
       functional_verification: {
         protocol: 'VLESS',
         transports: ['TCP', 'RAW', 'WebSocket'],
@@ -1288,10 +1288,17 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const start = Math.max(0, Number(state.cursor) || 0) % pool.length;
   const batch = [];
   for (let i = 0; i < Math.min(CHECKS_PER_RUN, pool.length); i += 1) batch.push(pool[(start + i) % pool.length]);
+  const lastDohCheck = Date.parse(state.last_doh_tls_checked_at || '');
+  const dohCheckDue = !Number.isFinite(lastDohCheck) || now - lastDohCheck >= 60 * 60 * 1000;
   const [results, dohTransport] = await Promise.all([
     mapLimit(batch, PROBE_CONCURRENCY, (endpoint) => probeMoscowPair(endpoint)),
-    probeMoscowDohTransport(),
+    dohCheckDue
+      ? probeMoscowDohTransport()
+      : Promise.resolve({ skipped: true, reason: 'Yandex DoH TLS baseline checked within the last hour', last_checked_at: state.last_doh_tls_checked_at || null }),
   ]);
+  if (dohCheckDue && dohTransport && !dohTransport.pending) {
+    state.last_doh_tls_checked_at = new Date(now).toISOString();
+  }
   results.forEach((result, index) => applyProbeResult(state, batch[index], result, now));
 
   const verificationJobs = [];
@@ -1362,7 +1369,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const subscriptionText = renderHappSubscription(activeNodes);
   const happProfiles = buildHappJsonConfigs(activeNodes);
   const happJsonText = `${JSON.stringify(happProfiles, null, 2)}\n`;
-  const measurementCount = batch.length * 2 + 1;
+  const measurementCount = batch.length * 2 + Number(dohCheckDue);
   const fingerprintPayload = buildManifest({ now: '', candidates: pool.length, checked: batch.length, measurements: measurementCount, nodes: activeNodes });
   const contentFingerprint = await sha256Hex(`${JSON.stringify(fingerprintPayload)}\n${subscriptionText}\n${happJsonText}`);
   const contentChanged = contentFingerprint !== state.last_content_fingerprint;
@@ -1381,7 +1388,8 @@ async function runScanner(env, scheduledTime = Date.now()) {
     candidate_endpoints: pool.length,
     checked: batch.length,
     moscow_pairs_ok: results.filter((result) => result?.ok).length,
-    moscow_measurements: results.reduce((sum, result) => sum + (Number(result?.measurements_completed) || 0), 0) + Number(dohTransport && !dohTransport.pending),
+    moscow_measurements: results.reduce((sum, result) => sum + (Number(result?.measurements_completed) || 0), 0) + Number(dohCheckDue && dohTransport && !dohTransport.pending),
+    doh_tls_check_due: dohCheckDue,
     yandex_doh_transport: dohTransport,
     pending_or_errors: results.filter((result) => !result?.ok).length,
     estimated_sweep_minutes: calculateSweepMinutes(pool.length),
@@ -1432,9 +1440,13 @@ export default {
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
         probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP MTR + Yandex DNS from Moscow; VLESS authentication, download and HTTPS requests to YouTube and Discord through each proxy from Cloudflare Worker egress' },
-        schedule: '15-minute scan; up to 30 endpoints; 2 Globalping measurements per endpoint + 1 Yandex DoH TLS check per scan; 244 measurements/hour max; VLESS auth + 256 KiB download + YouTube HTTPS + Discord HTTPS through proxy',
-        max_tests_per_hour: 240,
-        estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
+        schedule: '15-minute full scan split into six batches of 5 endpoints every 2 minutes. 240 Globalping MTR/DNS measurements/hour + at most 1 Yandex DoH TLS baseline/hour. VLESS auth + download + YouTube HTTPS + Discord HTTPS through proxy.',
+        max_tests_per_hour: 241,
+        batch_size: CHECKS_PER_RUN,
+        batch_interval_minutes: SCHEDULE_INTERVAL_MINUTES,
+        estimated_batch_sweep_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
+        full_scan_interval_minutes: 15,
+        estimated_full_pool_cycle_minutes: 15,
         last_run: state.last_run || null,
       }, { headers: { 'cache-control': 'no-store' } });
     }
