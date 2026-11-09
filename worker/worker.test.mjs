@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyProbeResult,
   buildMoscowDnsConfig,
   buildXrayStreamSettings,
   calculateSweepMinutes,
   decodeMaybeBase64,
   evaluateMoscowHistory,
   parseGlobalpingTcpResult,
+  probeMoscowPair,
   parseProxyUri,
 } from './worker.mjs';
 
@@ -200,4 +202,70 @@ test('a 45-endpoint Moscow pool stays below the public Globalping hourly limit',
   assert.equal(180 < 250, true);
   assert.equal(calculateSweepMinutes(46, 3), 16);
   assert.equal(calculateSweepMinutes(0, 3), 0);
+});
+
+
+test('runs two independent Moscow TCP measurements for each candidate', async () => {
+  let calls = 0;
+  const paired = await probeMoscowPair(
+    { host: 'proxy.example.net', port: 443 },
+    async () => {
+      calls += 1;
+      return {
+        ok: true,
+        latency_ms: 40 + calls * 10,
+        jitter_ms: 4,
+        loss_pct: 0,
+        network: 'Moscow ISP',
+        probe_location: 'Moscow',
+      };
+    },
+  );
+
+  assert.equal(calls, 2);
+  assert.equal(paired.ok, true);
+  assert.equal(paired.samples.length, 2);
+  assert.deepEqual(paired.samples.map((sample) => sample.latency_ms), [50, 60]);
+});
+
+test('publishes a candidate after two independent successful Moscow samples', () => {
+  const state = { endpoints: {} };
+  applyProbeResult(
+    state,
+    { key: 'proxy.example.net:443' },
+    {
+      ok: true,
+      samples: [
+        { ok: true, latency_ms: 50, jitter_ms: 5, loss_pct: 0, network: 'Moscow ISP' },
+        { ok: true, latency_ms: 60, jitter_ms: 7, loss_pct: 0, network: 'Moscow ISP' },
+      ],
+    },
+    Date.parse('2026-11-09T00:20:00.000Z'),
+  );
+
+  const status = state.endpoints['proxy.example.net:443'];
+  assert.equal(status.available, true);
+  assert.equal(status.reliability_pct, 100);
+  assert.equal(status.consecutive_successes, 2);
+  assert.equal(status.recent_samples.length, 2);
+  assert.equal(status.latency_ms, 55);
+});
+
+test('does not publish a candidate if only one of two Moscow samples succeeds', () => {
+  const state = { endpoints: {} };
+  applyProbeResult(
+    state,
+    { key: 'proxy.example.net:443' },
+    {
+      ok: false,
+      samples: [
+        { ok: true, latency_ms: 50, jitter_ms: 5, loss_pct: 0 },
+        { ok: false, error: 'connection refused' },
+      ],
+    },
+    Date.parse('2026-11-09T00:20:00.000Z'),
+  );
+
+  assert.equal(state.endpoints['proxy.example.net:443'].available, false);
+  assert.equal(state.endpoints['proxy.example.net:443'].reliability_pct, 50);
 });
