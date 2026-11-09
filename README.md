@@ -41,7 +41,7 @@ TLS profiles use the Chrome uTLS fingerprint by default and preserve source-prov
 - Runtime and persistent state: Cloudflare Workers + Workers KV.
 - GitHub is used only to fetch public source lists. No GitHub token or repository write permission is required by the deployed Worker.
 - Public feeds: [peasoft/NoMoreWalls](https://github.com/peasoft/NoMoreWalls), [ts-sf/fly](https://github.com/ts-sf/fly), [morpheusadam/v2ray-config](https://github.com/morpheusadam/v2ray-config), [Alirewa/V2ray-Configs](https://github.com/Alirewa/V2ray-Configs), and [chaishpish/free_server_v2ray](https://github.com/chaishpish/free_server_v2ray).
-- One stale source is refreshed per minute, with a 9-minute cache TTL.
+- One stale source is refreshed per run, with a 9-minute cache TTL.
 
 ## Important limitations
 
