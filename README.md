@@ -1,35 +1,52 @@
 # LEDERG PROXY
 
-Cloudflare-hosted collector that builds HAPP-compatible proxy subscriptions from public GitHub feeds.
+Cloudflare-hosted collector that builds HAPP-compatible subscriptions from public GitHub proxy feeds, then ranks TCP-capable nodes using probes located in Moscow, Russia.
 
-## Live Cloudflare endpoints
+## Live HAPP endpoints
 
-- [`/json`](https://lederg-proxy-scanner.lederg.workers.dev/json) — live HAPP/Xray JSON profile array.
-- [`/happ`](https://lederg-proxy-scanner.lederg.workers.dev/happ) — live text subscription with proxy URIs.
-- [`/manifest`](https://lederg-proxy-scanner.lederg.workers.dev/manifest) — latest scan status, counts, source list and probe metadata.
+- [`/json`](https://lederg-proxy-scanner.lederg.workers.dev/json) — HAPP/Xray JSON profile array.
+- [`/happ`](https://lederg-proxy-scanner.lederg.workers.dev/happ) — text subscription with original proxy URIs.
+- [`/manifest`](https://lederg-proxy-scanner.lederg.workers.dev/manifest) — scan status, Moscow probe metadata, node quality and feed details.
 - [`/health`](https://lederg-proxy-scanner.lederg.workers.dev/health) — Worker health and most recent run.
 
-Add only one of the live subscription links to HAPP. The `/json` endpoint returns an Xray JSON profile array; `/happ` returns a standard text subscription.
+Add one subscription URL to HAPP. The JSON output includes resolver and transport settings for every generated Xray profile.
 
-## Storage and schedule
+## Moscow-first measurement and rating
 
-- Runtime and storage: Cloudflare Workers + Workers KV. Cloudflare KV is the canonical store for feed caches, scan state and subscription output.
-- No GitHub token or repository write permission is required. GitHub is used only to download public source lists.
-- Sources are refreshed gradually: one stale source per minute, with a 9-minute source cache TTL.
-- Cron runs every minute and tests up to 20 endpoints per run.
-- The endpoint pool is capped at 300 unique host:port pairs. At that cap, each endpoint receives a TCP check in an approximately 15-minute rotation.
-- Six TCP connection attempts run concurrently, respecting the Workers Free plan's simultaneous outgoing-connection limit.
+- Measurement network: [Globalping](https://globalping.io/) community probes.
+- Required location: city `Moscow`, country `RU`. Results from other locations are rejected.
+- Measurement: TCP ping to the exact proxy host and port, 3 packets per measurement.
+- Each candidate gets a rolling history of up to 5 measurements.
+- Ranking uses median Moscow latency, RTT spread (jitter), packet loss and recent reliability.
+- A node is only published after at least two successful Moscow measurements, at least 80% recent reliability, and two consecutive recent successes.
+- Two consecutive failures remove it from the active set.
+- The pool is capped at 45 unique TCP endpoints. Three measurements run per minute, giving a 15-minute full sweep (180 tests/hour, below Globalping's unauthenticated 250 tests/hour limit).
+- This is a TCP availability/routing measurement, not a full protocol authentication or throughput test. UDP-only Hysteria2 nodes are excluded from the Moscow TCP pool.
 
-## GitHub sources
+## DNS and TLS profile settings
 
-- [peasoft/NoMoreWalls](https://github.com/peasoft/NoMoreWalls)
-- [ts-sf/fly](https://github.com/ts-sf/fly)
-- [morpheusadam/v2ray-config](https://github.com/morpheusadam/v2ray-config)
-- [Alirewa/V2ray-Configs](https://github.com/Alirewa/V2ray-Configs)
-- [chaishpish/free_server_v2ray](https://github.com/chaishpish/free_server_v2ray)
+Xray JSON profiles use non-Cloudflare DNS-over-HTTPS resolvers, in this order:
 
-## Measurement caveats
+1. Yandex DoH — `https://common.dot.dns.yandex.net/dns-query`
+2. Google DoH — `https://dns.google/dns-query`
+3. AdGuard DoH — `https://dns.adguard-dns.com/dns-query`
+4. Quad9 DoH — `https://dns.quad9.net/dns-query`
 
-The Worker measures TCP handshake reachability and latency from Cloudflare's edge. This is **not** a Moscow/Russia measurement and does not prove that a full VPN tunnel, authentication, traffic forwarding, or exit-IP routing works. Latency from a Cloudflare location can differ from latency experienced by a user or ISP in Russia.
+Resolver hostnames are mapped to their published IP addresses to avoid DNS bootstrap loops. Xray uses sequential fallback if a resolver fails. Queries are configured to follow Xray routing rather than using `+local` direct mode.
 
-Country labels are inherited from the source feed or node name; they are not independently verified geolocation. Public proxy nodes are untrusted third-party infrastructure. Do not use them for banking, private accounts, or sensitive traffic.
+TLS profiles use the Chrome uTLS fingerprint by default and preserve source-provided SNI/ALPN. REALITY profiles preserve the public key, short ID, SNI and spider path from the source URI; no fake server parameters are invented. REALITY entries with incompatible transports are skipped.
+
+## Cloudflare storage and source feeds
+
+- Runtime and persistent state: Cloudflare Workers + Workers KV.
+- GitHub is used only to fetch public source lists. No GitHub token or repository write permission is required by the deployed Worker.
+- Public feeds: [peasoft/NoMoreWalls](https://github.com/peasoft/NoMoreWalls), [ts-sf/fly](https://github.com/ts-sf/fly), [morpheusadam/v2ray-config](https://github.com/morpheusadam/v2ray-config), [Alirewa/V2ray-Configs](https://github.com/Alirewa/V2ray-Configs), and [chaishpish/free_server_v2ray](https://github.com/chaishpish/free_server_v2ray).
+- One stale source is refreshed per minute, with a 9-minute cache TTL.
+
+## Important limitations
+
+Moscow TCP ping indicates that the proxy's port is reachable from a Moscow community probe. It does not prove the VLESS/VMess/Trojan/SS credentials work, that the remote server forwards traffic, or that every Russian ISP has the same route. The Moscow probe may use a different ISP/ASN from the user.
+
+DNS-over-HTTPS and TLS/REALITY settings are client-side profile settings; they do not alter the public proxy server. TLS fingerprinting only applies to TLS-capable configurations. REALITY requires the actual server-side parameters supplied in the original link. FakeDNS is a separate Xray feature and is not enabled by default because it can break DNS behavior when the HAPP profile is consumed through a different TUN/DNS setup.
+
+Public proxy nodes are third-party infrastructure. Do not use them for banking, private accounts, or sensitive traffic.
