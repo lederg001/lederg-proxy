@@ -10,6 +10,7 @@ import {
   calculateSweepMinutes,
   decodeMaybeBase64,
   evaluateMoscowHistory,
+  getMoscowDnsQueryHost,
   parseGlobalpingTcpResult,
   parseGlobalpingMtrResult,
   parseGlobalpingDnsResult,
@@ -43,6 +44,12 @@ test('builds TLS options supported by Cloudflare Workers without unsupported ALP
     rejectUnauthorized: true,
   });
   assert.equal('ALPNProtocols' in options, false);
+});
+
+test('uses a hostname for Moscow DNS checks when the proxy endpoint is an IP literal', () => {
+  assert.equal(getMoscowDnsQueryHost('178.22.31.72'), 'ya.ru');
+  assert.equal(getMoscowDnsQueryHost('2001:db8::1'), 'ya.ru');
+  assert.equal(getMoscowDnsQueryHost('proxy.example.net'), 'proxy.example.net');
 });
 
 test('accepts a TCP ping from a Moscow, RU probe using Globalping measurement response shape', () => {
