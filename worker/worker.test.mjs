@@ -486,7 +486,7 @@ test('requires an authenticated VLESS tunnel, upstream HTTP 200 and a real downl
   }, {
     openTunnel: async (_node, hostname, port) => {
       target = { hostname, port };
-      return { socket: fake.socket, connectedAt: performance.now() - 5, close: fake.close };
+      return { socket: fake.socket, connectedAt: performance.now() + 5, close: fake.close };
     },
   });
 
@@ -504,9 +504,7 @@ test('never accepts an open VLESS socket when tunneled HTTP returns an error', a
   const errorResponse = new TextEncoder().encode(
     'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n',
   );
-  const response = new Uint8Array(2 + errorResponse.length);
-  response.set([0, 0]);
-  response.set(errorResponse, 2);
+  const response = errorResponse;
   const fake = fakeProxySocket(response);
   const result = await verifyVlessProxy({
     protocol: 'vless',
@@ -514,7 +512,7 @@ test('never accepts an open VLESS socket when tunneled HTTP returns an error', a
     port: 443,
     uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp&security=none',
   }, {
-    openTunnel: async () => ({ socket: fake.socket, connectedAt: performance.now() - 2, close: fake.close }),
+    openTunnel: async () => ({ socket: fake.socket, connectedAt: performance.now() + 2, close: fake.close }),
   });
   assert.equal(result.ok, false);
   assert.match(result.error, /status 403/i);
