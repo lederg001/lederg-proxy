@@ -12,6 +12,11 @@ import {
   probeMoscowPair,
   parseProxyUri,
 } from './worker.mjs';
+import {
+  buildVlessProbeRequest,
+  getVlessProbeSupport,
+  verifyVlessProxy,
+} from './proxy-verifier.mjs';
 
 test('accepts a TCP ping from a Moscow, RU probe using Globalping measurement response shape', () => {
   const parsed = parseGlobalpingTcpResult({
@@ -288,4 +293,123 @@ test('reports the actual TLS fingerprint used by the generated HAPP profile', ()
   assert.equal(profiles[0].outbounds[0].streamSettings.tlsSettings.fingerprint, 'firefox');
   assert.equal(profiles[0].meta.tlsCamouflage, 'TLS + uTLS firefox');
   assert.equal(profiles[0].dns.servers[0], 'https://common.dot.dns.yandex.net/dns-query');
+});
+
+
+function fakeProxySocket(responseBytes) {
+  const writes = [];
+  const readable = new ReadableStream({
+    start(controller) {
+      controller.enqueue(responseBytes);
+      controller.close();
+    },
+  });
+  const writable = new WritableStream({
+    write(chunk) { writes.push(new Uint8Array(chunk)); },
+  });
+  return {
+    socket: { readable, writable, opened: Promise.resolve({}), close: async () => {} },
+    writes,
+  };
+}
+
+test('supports only VLESS transports the verifier can actually negotiate', () => {
+  const base = {
+    protocol: 'vless',
+    host: 'proxy.example.net',
+    port: 443,
+    uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=ws&security=none&path=%2Fedge',
+  };
+  assert.deepEqual(getVlessProbeSupport(base), {
+    supported: true,
+    network: 'ws',
+    security: 'none',
+    path: '/edge',
+    wsHost: 'proxy.example.net',
+    sni: 'proxy.example.net',
+  });
+  assert.equal(getVlessProbeSupport({ ...base, protocol: 'vmess' }).supported, false);
+  assert.equal(getVlessProbeSupport({
+    ...base,
+    uri: base.uri.replace('type=ws', 'type=grpc'),
+  }).supported, false);
+  assert.equal(getVlessProbeSupport({
+    ...base,
+    uri: base.uri.replace('security=none', 'security=reality'),
+  }).supported, false);
+});
+
+test('rejects TLS nodes whose SNI cannot be set independently from the socket hostname', () => {
+  const result = getVlessProbeSupport({
+    protocol: 'vless',
+    host: '203.0.113.10',
+    port: 443,
+    uri: 'vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?type=tcp&security=tls&sni=cdn.example.net',
+  });
+  assert.equal(result.supported, false);
+  assert.match(result.reason, /SNI/i);
+});
+
+test('builds a VLESS TCP CONNECT request with a real UUID and HTTP probe payload', () => {
+  const bytes = buildVlessProbeRequest(
+    'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp',
+    'probe.example.net',
+    80,
+    '/check.bin',
+  );
+  assert.equal(bytes[0], 0);
+  assert.deepEqual([...bytes.slice(1, 17)], [
+    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11,
+    0x81, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+  ]);
+  assert.equal(new TextDecoder().decode(bytes).includes('GET /check.bin HTTP/1.1'), true);
+});
+
+test('requires VLESS authentication response, upstream HTTP 200 and a real download sample', async () => {
+  const body = new Uint8Array(64 * 1024).fill(0x61);
+  const header = new TextEncoder().encode('HTTP/1.1 200 OK\\r\\nContent-Length: 1048576\\r\\n\\r\\n');
+  const response = new Uint8Array(2 + header.length + body.length);
+  response[0] = 0; // VLESS response version
+  response[1] = 0; // no response addons
+  response.set(header, 2);
+  response.set(body, 2 + header.length);
+  const fake = fakeProxySocket(response);
+  let options;
+  const result = await verifyVlessProxy({
+    protocol: 'vless',
+    host: 'proxy.example.net',
+    port: 443,
+    uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp&security=none',
+  }, (address, socketOptions) => {
+    options = { address, socketOptions };
+    return fake.socket;
+  });
+
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.supported, true);
+  assert.equal(result.http_status, 200);
+  assert.equal(result.download_bytes, 64 * 1024);
+  assert.equal(result.probe_location, 'Cloudflare Worker egress (not Moscow)');
+  assert.equal(options.address.hostname, 'proxy.example.net');
+  assert.equal(options.socketOptions.secureTransport, 'off');
+  const sent = new TextDecoder().decode(fake.writes[0]);
+  assert.equal(sent.includes('GET /1MB.zip HTTP/1.1'), true);
+});
+
+test('never accepts an open VLESS socket when tunneled HTTP returns an error', async () => {
+  const errorResponse = new TextEncoder().encode(
+    'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n',
+  );
+  const response = new Uint8Array(2 + errorResponse.length);
+  response.set([0, 0]);
+  response.set(errorResponse, 2);
+  const fake = fakeProxySocket(response);
+  const result = await verifyVlessProxy({
+    protocol: 'vless',
+    host: 'proxy.example.net',
+    port: 443,
+    uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp&security=none',
+  }, () => fake.socket);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /status 403/i);
 });
