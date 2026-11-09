@@ -11,6 +11,7 @@ import {
   parseGlobalpingTcpResult,
   probeMoscowPair,
   parseProxyUri,
+  selectVerifiableConfigs,
 } from './worker.mjs';
 import {
   buildVlessProbeRequest,
@@ -413,4 +414,15 @@ test('never accepts an open VLESS socket when tunneled HTTP returns an error', a
   }, () => fake.socket);
   assert.equal(result.ok, false);
   assert.match(result.error, /status 403/i);
+});
+
+
+test('selects only VLESS configs with a supported full-verification transport', () => {
+  const configs = [
+    { protocol: 'vmess', uri: 'vmess://not-verified', host: 'proxy.example.net', port: 443 },
+    { protocol: 'vless', uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=grpc', host: 'proxy.example.net', port: 443 },
+    { protocol: 'vless', uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp&security=none', host: 'proxy.example.net', port: 443 },
+    { protocol: 'trojan', uri: 'trojan://password@proxy.example.net:443', host: 'proxy.example.net', port: 443 },
+  ];
+  assert.deepEqual(selectVerifiableConfigs(configs, 3), [configs[2]]);
 });
