@@ -236,31 +236,28 @@ async function readHttpHeaders(tunnel) {
   return { status: Number(match[1]), headers };
 }
 
-export async function verifyVlessProxy(node, connectFn) {
+export async function verifyVlessProxy(node, dependencies = {}) {
   const support = getVlessProbeSupport(node);
   if (!support.supported) return { ok: false, supported: false, error: support.reason };
-  let socket;
+  let tunnel;
+  let reader;
   const startedAt = performance.now();
   try {
-    let connector = connectFn;
-    if (!connector) {
-      const sockets = await import('cloudflare:sockets');
-      connector = sockets.connect;
-    }
-    socket = connector(
-      { hostname: node.host, port: node.port },
-      { secureTransport: support.security === 'tls' ? 'on' : 'off', allowHalfOpen: true },
+    tunnel = dependencies.openTunnel
+      ? await dependencies.openTunnel(node, TEST_HOST, 80)
+      : await openVlessTunnel(node, TEST_HOST, 80, dependencies);
+    const request = TEXT.encode(
+      `GET ${TEST_PATH} HTTP/1.1\\r\\nHost: ${TEST_HOST}\\r\\nUser-Agent: LEDERG-Proxy-Health/1.0\\r\\nAccept: */*\\r\\nConnection: close\\r\\n\\r\\n`,
     );
-    await timeout(socket.opened, SOCKET_TIMEOUT_MS, 'TCP/TLS connection to the proxy timed out');
-    const connectedAt = performance.now();
-    const tunnel = await createTunnel(socket, node, support);
-    const request = buildVlessProbeRequest(node.uri);
-    await tunnel.write(request);
-    const vlessHeader = await tunnel.readExactly(2);
-    if (vlessHeader[0] !== 0) throw new Error('The proxy did not return a valid VLESS response header');
-    const addonLength = vlessHeader[1];
-    if (addonLength > 0) await tunnel.readExactly(addonLength);
-    const http = await readHttpHeaders(tunnel);
+    const responseStartedAt = performance.now();
+    await writeSocket(tunnel.socket, request);
+    reader = new SocketByteReader(tunnel.socket);
+    const headerBytes = await timeout(
+      reader.readUntil(),
+      SOCKET_TIMEOUT_MS,
+      'Timed out waiting for the proxy speed-test response',
+    );
+    const http = parseHttpResponseHead(headerBytes);
     if (http.status !== 200) throw new Error(`Proxy tunnel HTTP test returned status ${http.status}`);
     const declaredLength = Number(http.headers['content-length'] || 0);
     if (declaredLength > 0 && declaredLength < MIN_DOWNLOAD_BYTES) {
@@ -271,7 +268,11 @@ export async function verifyVlessProxy(node, connectFn) {
     let firstByteAt = 0;
     const downloadStartedAt = performance.now();
     while (bytes < MIN_DOWNLOAD_BYTES && performance.now() - downloadStartedAt < DOWNLOAD_TIMEOUT_MS) {
-      const chunk = await tunnel.readSome(Math.max(1000, DOWNLOAD_TIMEOUT_MS - (performance.now() - downloadStartedAt)));
+      const chunk = await timeout(
+        reader.readSome(),
+        Math.max(1000, DOWNLOAD_TIMEOUT_MS - (performance.now() - downloadStartedAt)),
+        'Download stalled through proxy',
+      );
       if (!chunk?.length) break;
       if (!firstByteAt) firstByteAt = performance.now();
       bytes += chunk.length;
@@ -279,35 +280,40 @@ export async function verifyVlessProxy(node, connectFn) {
     const finishedAt = performance.now();
     const transferMs = Math.max(1, finishedAt - (firstByteAt || downloadStartedAt));
     const downloadMbps = Number(((bytes * 8) / (transferMs / 1000) / 1_000_000).toFixed(3));
-    if (bytes < MIN_DOWNLOAD_BYTES) throw new Error(`Proxy tunnel delivered only ${bytes} bytes; minimum is ${MIN_DOWNLOAD_BYTES}`);
+    if (bytes < MIN_DOWNLOAD_BYTES) {
+      throw new Error(`Proxy tunnel delivered only ${bytes} bytes; minimum is ${MIN_DOWNLOAD_BYTES}`);
+    }
     if (downloadMbps < MIN_DOWNLOAD_MBPS) {
       throw new Error(`Proxy download speed ${downloadMbps} Mbps is below the ${MIN_DOWNLOAD_MBPS} Mbps minimum`);
     }
     return {
       ok: true,
       supported: true,
-      verifier: 'VLESS protocol response + HTTP 200 egress + download sample',
-      probe_location: 'Cloudflare Worker egress (not Moscow)',
-      connect_ms: Math.round(connectedAt - startedAt),
+      verifier: 'VLESS auth + HTTP 200 egress + download sample',
+      probe_location: 'Cloudflare Worker egress through VLESS tunnel (not Moscow)',
+      connect_ms: Number.isFinite(Number(tunnel.connect_ms))
+        ? Number(tunnel.connect_ms)
+        : Math.round((tunnel.connectedAt || startedAt) - startedAt),
       tunnel_ms: Math.round(finishedAt - startedAt),
       download_ms: Math.round(transferMs),
       download_bytes: bytes,
       download_mbps: downloadMbps,
       http_status: http.status,
       target: `${TEST_HOST}${TEST_PATH}`,
+      speed_test_response_ms: Math.round(finishedAt - responseStartedAt),
     };
   } catch (error) {
     return {
       ok: false,
       supported: true,
       error: error instanceof Error ? error.message : String(error),
-      probe_location: 'Cloudflare Worker egress (not Moscow)',
+      probe_location: 'Cloudflare Worker egress through VLESS tunnel (not Moscow)',
     };
   } finally {
-    try { await socket?.close(); } catch { /* close errors do not change the test result */ }
+    try { reader?.detach(); } catch { /* best-effort cleanup */ }
+    try { tunnel?.close?.(); } catch { /* best-effort cleanup */ }
   }
 }
-
 
 export const VLESS_SERVICE_PROBES = Object.freeze([
   Object.freeze({
@@ -375,6 +381,18 @@ class SocketByteReader {
     while (this.buffer.length < length) await this.waitForData();
     const result = this.buffer.slice(0, length);
     this.buffer = this.buffer.slice(length);
+    return result;
+  }
+
+  async readSome() {
+    if (this.buffer.length) {
+      const result = this.buffer;
+      this.buffer = new Uint8Array(0);
+      return result;
+    }
+    await this.waitForData();
+    const result = this.buffer;
+    this.buffer = new Uint8Array(0);
     return result;
   }
 
@@ -569,7 +587,7 @@ function createWebSocketDuplex(socket, Duplex) {
     }
   };
   stream = new Duplex({
-    read() {},
+    read() { parseFrames(); },
     write(chunk, _encoding, callback) {
       socket.write(makeWebSocketFrame(new Uint8Array(chunk)), callback);
     },
@@ -588,75 +606,105 @@ function createWebSocketDuplex(socket, Duplex) {
   return stream;
 }
 
-async function verifyVlessService(node, service, dependencies = {}) {
-  let rawSocket;
-  let proxySocket;
-  let tunnelSocket;
-  let serviceTls;
-  let websocketStream;
-  const startedAt = performance.now();
-  try {
-    const support = getVlessProbeSupport(node);
-    if (!support.supported) return { ok: false, service: service.id, error: support.reason };
-    const netModule = dependencies.net || await import('node:net');
-    const tlsModule = dependencies.tls || await import('node:tls');
-    const streamModule = dependencies.stream || await import('node:stream');
-    const connect = dependencies.connect || netModule.connect;
-    const tlsConnect = dependencies.tlsConnect || tlsModule.connect;
-    const Duplex = dependencies.Duplex || streamModule.Duplex;
 
-    rawSocket = connect({ host: node.host, port: node.port });
+async function openVlessTunnel(node, targetHost, targetPort, dependencies = {}) {
+  const support = getVlessProbeSupport(node);
+  if (!support.supported) throw new Error(support.reason);
+  const netModule = dependencies.net || await import('node:net');
+  const tlsModule = dependencies.tls || await import('node:tls');
+  const streamModule = dependencies.stream || await import('node:stream');
+  const connect = dependencies.connect || netModule.connect;
+  const tlsConnect = dependencies.tlsConnect || tlsModule.connect;
+  const Duplex = dependencies.Duplex || streamModule.Duplex;
+  const rawSocket = connect({ host: node.host, port: node.port });
+  let proxySocket = rawSocket;
+  let websocketStream = null;
+  try {
     await timeout(
       waitForSocketEvent(rawSocket, 'connect', SERVICE_TIMEOUT_MS, 'TCP connection to the VLESS server timed out'),
       SERVICE_TIMEOUT_MS + 100,
       'TCP connection to the VLESS server timed out',
     );
     const connectedAt = performance.now();
-    proxySocket = rawSocket;
 
     if (support.security === 'tls') {
-      const outerOptions = {
+      const servername = support.sni && !isIpLiteral(support.sni) ? support.sni : undefined;
+      proxySocket = tlsConnect({
         socket: rawSocket,
+        host: support.sni || node.host,
+        ...(servername ? { servername } : {}),
         rejectUnauthorized: true,
         ALPNProtocols: ['http/1.1'],
-        ...(support.sni ? { servername: support.sni } : {}),
-        ...(support.sni ? { host: support.sni } : {}),
-      };
-      proxySocket = tlsConnect(outerOptions);
+      });
       await timeout(
         waitForSocketEvent(proxySocket, 'secureConnect', SERVICE_TIMEOUT_MS, 'TLS to the VLESS server timed out'),
         SERVICE_TIMEOUT_MS + 100,
         'TLS to the VLESS server timed out',
       );
-      if (proxySocket.authorized === false) throw new Error('TLS certificate for the VLESS server is not trusted');
+      if (proxySocket.authorized !== true) {
+        throw new Error(`TLS certificate for VLESS server is not trusted: ${proxySocket.authorizationError || 'unknown error'}`);
+      }
     }
 
+    let tunnelSocket = proxySocket;
     if (support.network === 'ws') {
       await validateWebSocketUpgrade(proxySocket, support, node.port);
       websocketStream = createWebSocketDuplex(proxySocket, Duplex);
       tunnelSocket = websocketStream;
-    } else {
-      tunnelSocket = proxySocket;
     }
 
-    await writeSocket(tunnelSocket, buildVlessConnectHeader(node.uri, service.hostname, service.port));
-    const vlessReader = new SocketByteReader(tunnelSocket);
-    const responseHeader = await timeout(
-      vlessReader.readExactly(2),
+    await writeSocket(tunnelSocket, buildVlessConnectHeader(node.uri, targetHost, targetPort));
+    const reader = new SocketByteReader(tunnelSocket);
+    const header = await timeout(
+      reader.readExactly(2),
       SERVICE_TIMEOUT_MS,
-      'VLESS target connection timed out',
+      `VLESS connection to ${targetHost} timed out`,
     );
-    if (responseHeader[0] !== 0) throw new Error('The proxy did not return a valid VLESS response');
-    if (responseHeader[1] > 0) await timeout(
-      vlessReader.readExactly(responseHeader[1]),
-      SERVICE_TIMEOUT_MS,
-      'VLESS response addons timed out',
-    );
-    vlessReader.detach();
+    if (header[0] !== 0) throw new Error('The proxy did not return a valid VLESS response');
+    if (header[1] > 0) {
+      await timeout(reader.readExactly(header[1]), SERVICE_TIMEOUT_MS, 'VLESS response addons timed out');
+    }
+    reader.detach();
+
+    return {
+      socket: tunnelSocket,
+      connectedAt,
+      connect_ms: Math.round(connectedAt - (rawSocket.connecting ? connectedAt : (rawSocket._connectStart || connectedAt))),
+      close() {
+        try { websocketStream?.destroy(); } catch { /* best-effort cleanup */ }
+        try { proxySocket?.destroy(); } catch { /* best-effort cleanup */ }
+        if (rawSocket !== proxySocket) {
+          try { rawSocket?.destroy(); } catch { /* best-effort cleanup */ }
+        }
+      },
+    };
+  } catch (error) {
+    try { websocketStream?.destroy(); } catch { /* best-effort cleanup */ }
+    try { proxySocket?.destroy(); } catch { /* best-effort cleanup */ }
+    if (rawSocket !== proxySocket) {
+      try { rawSocket?.destroy(); } catch { /* best-effort cleanup */ }
+    }
+    throw error;
+  }
+}
+
+async function verifyVlessService(node, service, dependencies = {}) {
+  let tunnel;
+  let serviceTls;
+  let reader;
+  const startedAt = performance.now();
+  try {
+    const support = getVlessProbeSupport(node);
+    if (!support.supported) return { ok: false, service: service.id, error: support.reason };
+    const tlsModule = dependencies.tls || await import('node:tls');
+    const tlsConnect = dependencies.tlsConnect || tlsModule.connect;
+    tunnel = dependencies.openTunnel
+      ? await dependencies.openTunnel(node, service.hostname, service.port)
+      : await openVlessTunnel(node, service.hostname, service.port, dependencies);
 
     const tlsStartedAt = performance.now();
     serviceTls = tlsConnect({
-      socket: tunnelSocket,
+      socket: tunnel.socket,
       host: service.hostname,
       servername: service.hostname,
       rejectUnauthorized: true,
@@ -668,7 +716,7 @@ async function verifyVlessService(node, service, dependencies = {}) {
       `TLS to ${service.id} timed out through proxy`,
     );
     const tlsFinishedAt = performance.now();
-    if (serviceTls.authorized === false) {
+    if (serviceTls.authorized !== true) {
       throw new Error(`TLS certificate for ${service.id} was not trusted: ${serviceTls.authorizationError || 'unknown error'}`);
     }
 
@@ -680,16 +728,15 @@ async function verifyVlessService(node, service, dependencies = {}) {
       'Connection: close',
       '',
       '',
-    ].join('\r\n');
+    ].join('\\r\\n');
     const responseStartedAt = performance.now();
     await writeSocket(serviceTls, TEXT.encode(request));
-    const responseReader = new SocketByteReader(serviceTls);
+    reader = new SocketByteReader(serviceTls);
     const responseBytes = await timeout(
-      responseReader.readUntil(),
+      reader.readUntil(),
       SERVICE_TIMEOUT_MS,
       `HTTP response from ${service.id} timed out through proxy`,
     );
-    responseReader.detach();
     const response = parseHttpResponseHead(responseBytes);
     const completedAt = performance.now();
     const ok = service.acceptedStatuses.includes(response.status);
@@ -697,12 +744,12 @@ async function verifyVlessService(node, service, dependencies = {}) {
       ok,
       service: service.id,
       probe_location: 'Cloudflare Worker egress through VLESS tunnel (not Moscow)',
-      connect_ms: Math.round(connectedAt - startedAt),
+      connect_ms: tunnel.connect_ms ?? Math.round(tunnel.connectedAt - startedAt),
       tls_ms: Math.round(tlsFinishedAt - tlsStartedAt),
       response_ms: Math.round(completedAt - responseStartedAt),
       total_ms: Math.round(completedAt - startedAt),
       http_status: response.status,
-      tls_authorized: serviceTls.authorized !== false,
+      tls_authorized: serviceTls.authorized === true,
       tls_protocol: serviceTls.getProtocol?.() || null,
       alpn: serviceTls.alpnProtocol || null,
       target: `https://${service.hostname}${service.path}`,
@@ -716,12 +763,9 @@ async function verifyVlessService(node, service, dependencies = {}) {
       error: error instanceof Error ? error.message : String(error),
     };
   } finally {
-    try { serviceTls?.destroy(); } catch { /* best-effort socket cleanup */ }
-    try { websocketStream?.destroy(); } catch { /* best-effort socket cleanup */ }
-    try { proxySocket?.destroy(); } catch { /* best-effort socket cleanup */ }
-    if (rawSocket !== proxySocket) {
-      try { rawSocket?.destroy(); } catch { /* best-effort socket cleanup */ }
-    }
+    try { reader?.detach(); } catch { /* best-effort cleanup */ }
+    try { serviceTls?.destroy(); } catch { /* best-effort cleanup */ }
+    try { tunnel?.close?.(); } catch { /* best-effort cleanup */ }
   }
 }
 
