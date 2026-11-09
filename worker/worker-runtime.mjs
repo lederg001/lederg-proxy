@@ -1,4 +1,3 @@
-import { connect } from 'cloudflare:sockets';
 import scanner from './worker.mjs';
 
 export default {
@@ -6,6 +5,6 @@ export default {
     return scanner.fetch(request, env, ctx);
   },
   scheduled(controller, env, ctx) {
-    return scanner.scheduled(controller, env, connect, ctx);
+    return scanner.scheduled(controller, env, ctx);
   },
 };
