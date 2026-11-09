@@ -627,7 +627,22 @@ async function requestGlobalpingMeasurement(target, type, measurementOptions, fe
       }),
     });
     if (response.status === 429) return { pending: true, error: 'Globalping rate limit reached' };
-    if (!response.ok) return { pending: true, error: `Globalping dispatch HTTP ${response.status}` };
+    if (!response.ok) {
+      let detail = '';
+      try {
+        const body = await response.text();
+        try {
+          const parsed = JSON.parse(body);
+          detail = parsed?.error?.message || parsed?.message || body;
+        } catch {
+          detail = body;
+        }
+      } catch { /* response body may not be readable */ }
+      return {
+        pending: true,
+        error: `Globalping dispatch HTTP ${response.status}${detail ? `: ${String(detail).slice(0, 180)}` : ''}`,
+      };
+    }
     dispatch = await response.json();
   } catch (error) {
     return { pending: true, error: error instanceof Error ? error.message : String(error) };
@@ -642,7 +657,22 @@ async function requestGlobalpingMeasurement(target, type, measurementOptions, fe
         signal: AbortSignal.timeout(GLOBALPING_REQUEST_TIMEOUT_MS),
       });
       if (response.status === 429) return { pending: true, error: 'Globalping result rate limit reached' };
-      if (!response.ok) return { pending: true, error: `Globalping result HTTP ${response.status}` };
+      if (!response.ok) {
+        let detail = '';
+        try {
+          const body = await response.text();
+          try {
+            const parsed = JSON.parse(body);
+            detail = parsed?.error?.message || parsed?.message || body;
+          } catch {
+            detail = body;
+          }
+        } catch { /* response body may not be readable */ }
+        return {
+          pending: true,
+          error: `Globalping result HTTP ${response.status}${detail ? `: ${String(detail).slice(0, 180)}` : ''}`,
+        };
+      }
       const measurement = await response.json();
       if (measurement.status === 'in-progress') continue;
       return measurement;
