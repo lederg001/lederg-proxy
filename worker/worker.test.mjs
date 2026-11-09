@@ -287,6 +287,7 @@ test('reports the actual TLS fingerprint used by the generated HAPP profile', ()
     score: 42,
     country: 'FR',
     source: 'test',
+    functional_probe: { ok: true, verifier: 'test', verified_at: '2026-11-09T00:00:00.000Z', probe_location: 'test', connect_ms: 10, tunnel_ms: 20, download_ms: 30, download_bytes: 65536, download_mbps: 5, http_status: 200, target: 'test' },
   }]);
 
   assert.equal(profiles.length, 1);
@@ -367,7 +368,7 @@ test('builds a VLESS TCP CONNECT request with a real UUID and HTTP probe payload
 
 test('requires VLESS authentication response, upstream HTTP 200 and a real download sample', async () => {
   const body = new Uint8Array(64 * 1024).fill(0x61);
-  const header = new TextEncoder().encode('HTTP/1.1 200 OK\\r\\nContent-Length: 1048576\\r\\n\\r\\n');
+  const header = new TextEncoder().encode('HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n');
   const response = new Uint8Array(2 + header.length + body.length);
   response[0] = 0; // VLESS response version
   response[1] = 0; // no response addons
@@ -398,7 +399,7 @@ test('requires VLESS authentication response, upstream HTTP 200 and a real downl
 
 test('never accepts an open VLESS socket when tunneled HTTP returns an error', async () => {
   const errorResponse = new TextEncoder().encode(
-    'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n',
+    'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n',
   );
   const response = new Uint8Array(2 + errorResponse.length);
   response.set([0, 0]);
