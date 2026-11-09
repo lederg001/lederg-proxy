@@ -16,8 +16,10 @@ const FEED_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_SOURCE_BYTES = 768 * 1024;
 const MAX_POOL_ENDPOINTS = 30;
 const MAX_CONFIGS_PER_FEED = 120;
-const CHECKS_PER_RUN = 2;
-const PROBE_CONCURRENCY = 2;
+const SCHEDULE_INTERVAL_MINUTES = 15;
+const CHECKS_PER_RUN = MAX_POOL_ENDPOINTS;
+const PROBE_CONCURRENCY = 6;
+const VERIFIER_CONCURRENCY = 8;
 const ACTIVE_TTL_MS = 35 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 
@@ -28,7 +30,7 @@ export function calculateSweepMinutes(totalEndpoints, batchSize = CHECKS_PER_RUN
   if (!Number.isInteger(batchSize) || batchSize < 1) {
     throw new Error('batchSize must be a positive integer');
   }
-  return totalEndpoints === 0 ? 0 : Math.ceil(totalEndpoints / batchSize);
+  return totalEndpoints === 0 ? 0 : Math.ceil(totalEndpoints / batchSize) * SCHEDULE_INTERVAL_MINUTES;
 }
 
 export const FEEDS = [
@@ -523,7 +525,7 @@ export async function probeMoscow(endpoint, fetchFn = fetch) {
 
 export async function probeMoscowPair(endpoint, probeFn = probeMoscow) {
   // Two independent measurements of the same proxy endpoint are run in parallel.
-  // With two candidates per cron and a pool of 30, this uses 240 tests/hour.
+  // All 30 candidates are checked per 15-minute cron: 30 x 2 x 4 = 240 tests/hour.
   const checks = await Promise.all([probeFn(endpoint), probeFn(endpoint)]);
   const samples = checks
     .filter((check) => check && !check.pending)
@@ -1103,7 +1105,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
   }
   const verificationResults = await mapLimit(
     verificationJobs,
-    2,
+    VERIFIER_CONCURRENCY,
     ({ config }) => verifyVlessProxy(config),
   );
   verificationResults.forEach((result, index) => {
@@ -1191,7 +1193,7 @@ export default {
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
         probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping + separate VLESS tunnel and speed test from Cloudflare Worker egress' },
-        schedule: '* * * * * UTC; Moscow paired TCP checks + authenticated VLESS tunnel and 256 KiB HTTP download at >=1 Mbps; 30 candidates per 15-minute sweep; 240 Globalping tests/hour max',
+        schedule: '*/15 * * * * UTC; full 30-endpoint Moscow paired TCP scan + authenticated VLESS tunnel and 256 KiB HTTP download at >=1 Mbps; 240 Globalping tests/hour max',
         max_tests_per_hour: 240,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
