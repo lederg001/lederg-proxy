@@ -668,18 +668,18 @@ function truthyParam(value) {
 
 export const MOSCOW_DNS_SERVERS = [
   'https://common.dot.dns.yandex.net/dns-query',
-  'https://dns.adguard-dns.com/dns-query',
-  'https://dns.quad9.net/dns-query',
   'https://dns.google/dns-query',
+  'https://unfiltered.adguard-dns.com/dns-query',
+  'https://dns10.quad9.net/dns-query',
 ];
 
 export function buildMoscowDnsConfig() {
   return {
     hosts: {
-      'common.dot.dns.yandex.net': '77.88.8.8',
-      'dns.adguard-dns.com': ['94.140.14.14', '94.140.15.15'],
-      'dns.quad9.net': ['9.9.9.9', '149.112.112.112'],
+      'common.dot.dns.yandex.net': ['77.88.8.8', '77.88.8.1'],
       'dns.google': ['8.8.8.8', '8.8.4.4'],
+      'unfiltered.adguard-dns.com': ['94.140.14.140', '94.140.14.141'],
+      'dns10.quad9.net': ['9.9.9.10', '149.112.112.10'],
     },
     servers: [...MOSCOW_DNS_SERVERS],
     queryStrategy: 'UseIP',
