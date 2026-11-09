@@ -9,7 +9,10 @@ import {
   decodeMaybeBase64,
   evaluateMoscowHistory,
   parseGlobalpingTcpResult,
+  parseGlobalpingMtrResult,
+  parseGlobalpingDohResult,
   probeMoscowPair,
+  renderHappSubscription,
   parseProxyUri,
   selectVerifiableConfigs,
 } from './worker.mjs';
@@ -213,27 +216,25 @@ test('checks all 30 candidates every 15 minutes and stays below the Globalping h
 });
 
 
-test('runs two independent Moscow TCP measurements for each candidate', async () => {
-  let calls = 0;
+test('runs a Moscow TCP MTR and a real HTTPS DNS-over-HTTPS check for each candidate', async () => {
+  const calls = [];
   const paired = await probeMoscowPair(
     { host: 'proxy.example.net', port: 443 },
-    async () => {
-      calls += 1;
-      return {
-        ok: true,
-        latency_ms: 40 + calls * 10,
-        jitter_ms: 4,
-        loss_pct: 0,
-        network: 'Moscow ISP',
-        probe_location: 'Moscow',
-      };
+    async (_endpoint, type) => {
+      calls.push(type);
+      return type === 'mtr'
+        ? { ok: true, latency_ms: 50, jitter_ms: 4, loss_pct: 0, hops: 9, network: 'Moscow ISP', probe_location: 'Moscow' }
+        : { ok: true, query_ms: 18, answer_count: 2, tls_authorized: true, provider: 'Yandex DoH', probe_location: 'Moscow' };
     },
   );
 
-  assert.equal(calls, 2);
+  assert.deepEqual(calls.sort(), ['dns', 'mtr']);
   assert.equal(paired.ok, true);
-  assert.equal(paired.samples.length, 2);
-  assert.deepEqual(paired.samples.map((sample) => sample.latency_ms), [50, 60]);
+  assert.equal(paired.measurements_completed, 2);
+  assert.equal(paired.samples.length, 1);
+  assert.equal(paired.samples[0].latency_ms, 50);
+  assert.equal(paired.mtr.hops, 9);
+  assert.equal(paired.dns.answer_count, 2);
 });
 
 test('publishes a candidate after two independent successful Moscow samples', () => {
@@ -433,4 +434,101 @@ test('requires a meaningful end-to-end download sample and minimum speed', () =>
   assert.equal(PROXY_VERIFY_LIMITS.min_download_bytes, 256 * 1024);
   assert.equal(PROXY_VERIFY_LIMITS.min_download_mbps, 1);
   assert.equal(PROXY_VERIFY_LIMITS.supported_protocols.includes('VLESS'), true);
+});
+
+
+test('accepts a completed Moscow TCP MTR only when the final proxy hop responds without material loss', () => {
+  const parsed = parseGlobalpingMtrResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU', network: 'Example Moscow ISP', asn: 12345 },
+      result: {
+        status: 'finished',
+        resolvedAddress: '198.51.100.10',
+        hops: [
+          { resolvedAddress: '10.0.0.1', stats: { avg: 3, jAvg: 1, total: 5, rcv: 5, drop: 0, loss: 0 } },
+          { resolvedAddress: '198.51.100.10', stats: { min: 41, avg: 45, max: 49, jAvg: 3, total: 5, rcv: 5, drop: 0, loss: 0 } },
+        ],
+      },
+    }],
+  }, 'proxy.example.net');
+
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.latency_ms, 45);
+  assert.equal(parsed.jitter_ms, 3);
+  assert.equal(parsed.loss_pct, 0);
+  assert.equal(parsed.hops, 2);
+  assert.equal(parsed.network, 'Example Moscow ISP');
+});
+
+test('rejects Moscow MTR when the route never reaches the proxy endpoint', () => {
+  const parsed = parseGlobalpingMtrResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU' },
+      result: {
+        status: 'finished',
+        resolvedAddress: '198.51.100.10',
+        hops: [{ resolvedAddress: null, stats: { avg: null, jAvg: null, total: 5, rcv: 0, drop: 5, loss: 100 } }],
+      },
+    }],
+  }, 'proxy.example.net');
+
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /endpoint|hop|loss/i);
+});
+
+test('requires valid Yandex DoH TLS and a positive DNS answer from Moscow', () => {
+  const parsed = parseGlobalpingDohResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU', network: 'Example Moscow ISP' },
+      result: {
+        status: 'finished',
+        statusCode: 200,
+        tls: { authorized: true, protocol: 'TLSv1.3' },
+        rawBody: JSON.stringify({ Status: 0, Answer: [{ type: 1, data: '198.51.100.10' }] }),
+        timings: { total: 88, dns: 9, tcp: 20, tls: 31, firstByte: 18, download: 10 },
+      },
+    }],
+  }, 'proxy.example.net');
+
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.query_ms, 88);
+  assert.equal(parsed.answer_count, 1);
+  assert.equal(parsed.tls_authorized, true);
+  assert.equal(parsed.provider, 'Yandex DoH');
+});
+
+test('rejects DNS-over-HTTPS if the Moscow probe cannot validate the resolver TLS certificate', () => {
+  const parsed = parseGlobalpingDohResult({
+    status: 'finished',
+    results: [{
+      probe: { city: 'Moscow', country: 'RU' },
+      result: {
+        status: 'finished',
+        statusCode: 200,
+        tls: { authorized: false },
+        rawBody: JSON.stringify({ Status: 0, Answer: [{ type: 1, data: '198.51.100.10' }] }),
+        timings: { total: 88 },
+      },
+    }],
+  }, 'proxy.example.net');
+
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /TLS/i);
+});
+
+test('publishes a HAPP subscription with supported standard profile settings only', () => {
+  const subscription = renderHappSubscription([{
+    uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp',
+    score: 40,
+    ping_ms: 40,
+    functional_probe: { ok: true },
+  }]);
+
+  assert.match(subscription, /#profile-title: LEDERG PROXY/);
+  assert.match(subscription, /#profile-update-interval: 1/);
+  assert.doesNotMatch(subscription, /#subscriptions-sort-type/);
+  assert.doesNotMatch(subscription, /#subscription-auto-update-open-enable/);
 });
