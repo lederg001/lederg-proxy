@@ -1,4 +1,4 @@
-import { verifyVlessProxy } from './proxy-verifier.mjs';
+import { getVlessProbeSupport, verifyVlessProxy } from './proxy-verifier.mjs';
 
 const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
@@ -692,6 +692,11 @@ export function applyProbeResult(state, endpoint, result, now) {
   return updated;
 }
 
+export function selectVerifiableConfigs(configs, limit = 3) {
+  if (!Array.isArray(configs) || !Number.isInteger(limit) || limit < 1) return [];
+  return configs.filter((config) => getVlessProbeSupport(config).supported).slice(0, limit);
+}
+
 export function applyProxyVerificationResult(state, endpoint, config, result, now) {
   const status = state.endpoints[endpoint.key] || {};
   if (!status.verified_configs || typeof status.verified_configs !== 'object') status.verified_configs = {};
@@ -1080,7 +1085,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
   for (let index = 0; index < batch.length; index += 1) {
     const endpoint = batch[index];
     const moscowResult = results[index];
-    const selected = moscowResult?.ok ? endpoint.configs.slice(0, 3) : [];
+    const selected = moscowResult?.ok ? selectVerifiableConfigs(endpoint.configs, 3) : [];
     const selectedUris = new Set(selected.map((config) => config.uri));
     for (const config of endpoint.configs) {
       if (selectedUris.has(config.uri)) {
