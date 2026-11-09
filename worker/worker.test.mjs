@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyProbeResult,
+  applyProxyVerificationResult,
   buildHappJsonConfigs,
   buildMoscowDnsConfig,
   buildXrayStreamSettings,
@@ -21,6 +22,8 @@ import {
   buildVlessProbeRequest,
   getVlessProbeSupport,
   verifyVlessProxy,
+  verifyVlessServices,
+  VLESS_SERVICE_PROBES,
   PROXY_VERIFY_LIMITS,
 } from './proxy-verifier.mjs';
 
@@ -353,6 +356,102 @@ test('rejects TLS nodes whose SNI cannot be set independently from the socket ho
   });
   assert.equal(result.supported, false);
   assert.match(result.reason, /SNI/i);
+});
+
+test('defines direct HTTPS health checks for YouTube and Discord', () => {
+  assert.deepEqual(VLESS_SERVICE_PROBES.map((item) => ({
+    id: item.id,
+    hostname: item.hostname,
+    path: item.path,
+    acceptedStatuses: item.acceptedStatuses,
+  })), [
+    { id: 'youtube', hostname: 'www.youtube.com', path: '/generate_204', acceptedStatuses: [200, 204] },
+    { id: 'discord', hostname: 'discord.com', path: '/api/v10/gateway', acceptedStatuses: [200] },
+  ]);
+});
+
+test('requires both YouTube and Discord HTTPS requests to succeed through VLESS', async () => {
+  const seen = [];
+  const result = await verifyVlessServices(
+    { protocol: 'vless', uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp', host: 'proxy.example.net', port: 443 },
+    async (_node, service) => {
+      seen.push(service.id);
+      return {
+        ok: true,
+        service: service.id,
+        probe_location: 'Cloudflare Worker egress (not Moscow)',
+        connect_ms: 30,
+        tls_ms: 45,
+        response_ms: 70,
+        http_status: service.id === 'youtube' ? 204 : 200,
+        tls_authorized: true,
+        tls_protocol: 'TLSv1.3',
+      };
+    },
+  );
+
+  assert.deepEqual(seen.sort(), ['discord', 'youtube']);
+  assert.equal(result.ok, true);
+  assert.equal(result.youtube.ok, true);
+  assert.equal(result.youtube.http_status, 204);
+  assert.equal(result.discord.ok, true);
+  assert.equal(result.discord.http_status, 200);
+});
+
+test('rejects a proxy from HAPP when Discord is blocked even if YouTube works', async () => {
+  const result = await verifyVlessServices(
+    { protocol: 'vless', uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp', host: 'proxy.example.net', port: 443 },
+    async (_node, service) => ({
+      ok: service.id === 'youtube',
+      service: service.id,
+      http_status: service.id === 'youtube' ? 204 : 403,
+      tls_authorized: true,
+      error: service.id === 'discord' ? 'Discord returned HTTP 403' : null,
+    }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.youtube.ok, true);
+  assert.equal(result.discord.ok, false);
+  assert.match(result.error, /discord/i);
+});
+
+test('does not mark a VLESS profile verified if the YouTube or Discord egress check failed', () => {
+  const state = { endpoints: {} };
+  const node = { uri: 'vless://11111111-1111-4111-8111-111111111111@proxy.example.net:443?type=tcp' };
+  const result = applyProxyVerificationResult(
+    state,
+    { key: 'proxy.example.net:443' },
+    node,
+    {
+      ok: true,
+      supported: true,
+      http_status: 200,
+      download_bytes: 262144,
+      download_mbps: 5,
+      services: {
+        youtube: { ok: true, http_status: 204, response_ms: 50 },
+        discord: { ok: false, http_status: 403, error: 'blocked' },
+      },
+    },
+    Date.parse('2026-11-09T12:00:00.000Z'),
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.services.youtube.ok, true);
+  assert.equal(result.services.discord.ok, false);
+});
+
+test('keeps the source-provided TLS SNI when checking the target services through VLESS', () => {
+  const result = getVlessProbeSupport({
+    protocol: 'vless',
+    host: '203.0.113.10',
+    port: 443,
+    uri: 'vless://11111111-1111-4111-8111-111111111111@203.0.113.10:443?type=tcp&security=tls&sni=cdn.example.net',
+  });
+
+  assert.equal(result.supported, true);
+  assert.equal(result.sni, 'cdn.example.net');
 });
 
 test('builds a VLESS TCP CONNECT request with a real UUID and HTTP probe payload', () => {
