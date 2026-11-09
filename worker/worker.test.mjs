@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   applyProbeResult,
+  buildHappJsonConfigs,
   buildMoscowDnsConfig,
   buildXrayStreamSettings,
   calculateSweepMinutes,
@@ -268,4 +269,23 @@ test('does not publish a candidate if only one of two Moscow samples succeeds', 
 
   assert.equal(state.endpoints['proxy.example.net:443'].available, false);
   assert.equal(state.endpoints['proxy.example.net:443'].reliability_pct, 50);
+});
+
+
+test('reports the actual TLS fingerprint used by the generated HAPP profile', () => {
+  const profiles = buildHappJsonConfigs([{
+    uri: 'vless://11111111-1111-4111-8111-111111111111@node.example.net:443?security=tls&type=tcp&sni=cdn.example.net&fp=firefox',
+    protocol: 'vless',
+    host: 'node.example.net',
+    port: 443,
+    ping_ms: 42,
+    score: 42,
+    country: 'FR',
+    source: 'test',
+  }]);
+
+  assert.equal(profiles.length, 1);
+  assert.equal(profiles[0].outbounds[0].streamSettings.tlsSettings.fingerprint, 'firefox');
+  assert.equal(profiles[0].meta.tlsCamouflage, 'TLS + uTLS firefox');
+  assert.equal(profiles[0].dns.servers[0], 'https://common.dot.dns.yandex.net/dns-query');
 });
