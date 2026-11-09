@@ -606,6 +606,16 @@ function createWebSocketDuplex(socket, Duplex) {
 }
 
 
+export function buildWorkerTlsOptions({ socket, host, servername }) {
+  // Cloudflare Workers' node:tls runtime does not implement ALPNProtocols.
+  return {
+    socket,
+    host,
+    ...(servername ? { servername } : {}),
+    rejectUnauthorized: true,
+  };
+}
+
 async function openVlessTunnel(node, targetHost, targetPort, dependencies = {}) {
   const support = getVlessProbeSupport(node);
   if (!support.supported) throw new Error(support.reason);
@@ -629,13 +639,11 @@ async function openVlessTunnel(node, targetHost, targetPort, dependencies = {}) 
 
     if (support.security === 'tls') {
       const servername = support.sni && !isIpLiteral(support.sni) ? support.sni : undefined;
-      proxySocket = tlsConnect({
+      proxySocket = tlsConnect(buildWorkerTlsOptions({
         socket: rawSocket,
         host: support.sni || node.host,
-        ...(servername ? { servername } : {}),
-        rejectUnauthorized: true,
-        ALPNProtocols: ['http/1.1'],
-      });
+        servername,
+      }));
       await timeout(
         waitForSocketEvent(proxySocket, 'secureConnect', SERVICE_TIMEOUT_MS, 'TLS to the VLESS server timed out'),
         SERVICE_TIMEOUT_MS + 100,
@@ -703,13 +711,11 @@ async function verifyVlessService(node, service, dependencies = {}) {
       : await openVlessTunnel(node, service.hostname, service.port, dependencies);
 
     const tlsStartedAt = performance.now();
-    serviceTls = tlsConnect({
+    serviceTls = tlsConnect(buildWorkerTlsOptions({
       socket: tunnel.socket,
       host: service.hostname,
       servername: service.hostname,
-      rejectUnauthorized: true,
-      ALPNProtocols: ['http/1.1'],
-    });
+    }));
     await timeout(
       waitForSocketEvent(serviceTls, 'secureConnect', SERVICE_TIMEOUT_MS, `TLS to ${service.id} timed out through proxy`),
       SERVICE_TIMEOUT_MS + 100,
