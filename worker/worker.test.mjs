@@ -134,13 +134,13 @@ test('uses only non-Cloudflare DoH resolvers and bootstraps their hostnames', ()
   assert.deepEqual(dns.servers, [
     'https://common.dot.dns.yandex.net/dns-query',
     'https://dns.google/dns-query',
-    'https://dns.adguard-dns.com/dns-query',
-    'https://dns.quad9.net/dns-query',
+    'https://unfiltered.adguard-dns.com/dns-query',
+    'https://dns10.quad9.net/dns-query',
   ]);
-  assert.deepEqual(dns.hosts['common.dot.dns.yandex.net'], '77.88.8.8');
+  assert.deepEqual(dns.hosts['common.dot.dns.yandex.net'], ['77.88.8.8', '77.88.8.1']);
   assert.deepEqual(dns.hosts['dns.google'], ['8.8.8.8', '8.8.4.4']);
-  assert.deepEqual(dns.hosts['dns.adguard-dns.com'], ['94.140.14.14', '94.140.15.15']);
-  assert.deepEqual(dns.hosts['dns.quad9.net'], ['9.9.9.9', '149.112.112.112']);
+  assert.deepEqual(dns.hosts['unfiltered.adguard-dns.com'], ['94.140.14.140', '94.140.14.141']);
+  assert.deepEqual(dns.hosts['dns10.quad9.net'], ['9.9.9.10', '149.112.112.10']);
   assert.equal(dns.enableParallelQuery, false);
   assert.equal(JSON.stringify(dns).includes('1.1.1.1'), false);
 });
