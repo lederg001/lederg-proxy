@@ -367,7 +367,7 @@ test('builds a VLESS TCP CONNECT request with a real UUID and HTTP probe payload
 });
 
 test('requires VLESS authentication response, upstream HTTP 200 and a real download sample', async () => {
-  const body = new Uint8Array(64 * 1024).fill(0x61);
+  const body = new Uint8Array(256 * 1024).fill(0x61);
   const header = new TextEncoder().encode('HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n');
   const response = new Uint8Array(2 + header.length + body.length);
   response[0] = 0; // VLESS response version
@@ -389,7 +389,7 @@ test('requires VLESS authentication response, upstream HTTP 200 and a real downl
   assert.equal(result.ok, true, result.error);
   assert.equal(result.supported, true);
   assert.equal(result.http_status, 200);
-  assert.equal(result.download_bytes, 64 * 1024);
+  assert.equal(result.download_bytes, 256 * 1024);
   assert.equal(result.probe_location, 'Cloudflare Worker egress (not Moscow)');
   assert.equal(options.address.hostname, 'proxy.example.net');
   assert.equal(options.socketOptions.secureTransport, 'off');
