@@ -2,7 +2,7 @@ const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
 const GLOBALPING_API = 'https://api.globalping.io/v1';
 const GLOBALPING_REQUEST_TIMEOUT_MS = 9000;
-const GLOBALPING_POLL_ATTEMPTS = 4;
+const GLOBALPING_POLL_ATTEMPTS = 8;
 const GLOBALPING_POLL_DELAY_MS = 600;
 const HISTORY_SIZE = 5;
 const MOSCOW_CITY = 'Moscow';
@@ -737,9 +737,9 @@ function truthyParam(value) {
 
 export const MOSCOW_DNS_SERVERS = [
   'https://common.dot.dns.yandex.net/dns-query',
-  'https://dns.google/dns-query',
   'https://unfiltered.adguard-dns.com/dns-query',
   'https://dns10.quad9.net/dns-query',
+  'https://dns.google/dns-query',
 ];
 
 export function buildMoscowDnsConfig() {
@@ -935,7 +935,7 @@ export function buildHappJsonConfigs(nodes) {
   return profiles;
 }
 
-export function buildManifest({ now = new Date().toISOString(), candidates = 0, checked = 0, nodes = [] } = {}) {
+export function buildManifest({ now = new Date().toISOString(), candidates = 0, checked = 0, measurements = 0, nodes = [] } = {}) {
   const byCountry = {};
   const endpoints = new Set();
   for (const node of nodes) {
@@ -957,6 +957,8 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
     stats: {
       candidate_endpoints: candidates,
       checked_this_run: checked,
+      checked_endpoints_this_run: checked,
+      measurements_this_run: measurements,
       active_endpoints: endpoints.size,
       active_configs: sorted.length,
       estimated_sweep_minutes: calculateSweepMinutes(candidates),
@@ -1026,11 +1028,12 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const subscriptionText = renderHappSubscription(activeNodes);
   const happProfiles = buildHappJsonConfigs(activeNodes);
   const happJsonText = `${JSON.stringify(happProfiles, null, 2)}\n`;
-  const fingerprintPayload = buildManifest({ now: '', candidates: pool.length, checked: batch.length, nodes: activeNodes });
+  const fingerprintPayload = buildManifest({ now: '', candidates: pool.length, checked: batch.length, measurements: batch.length * 2, nodes: activeNodes });
   const contentFingerprint = await sha256Hex(`${JSON.stringify(fingerprintPayload)}\n${subscriptionText}\n${happJsonText}`);
   const contentChanged = contentFingerprint !== state.last_content_fingerprint;
   const publishedAt = contentChanged ? new Date(now).toISOString() : (state.last_published_at || new Date(now).toISOString());
-  const stablePayload = buildManifest({ now: publishedAt, candidates: pool.length, checked: batch.length, nodes: activeNodes });
+  state.last_published_at = publishedAt;
+  const stablePayload = buildManifest({ now: publishedAt, candidates: pool.length, checked: batch.length, measurements: batch.length * 2, nodes: activeNodes });
   const manifestText = `${JSON.stringify(stablePayload, null, 2)}\n`;
   const publish = { skipped: true, reason: 'Outputs are stored in Cloudflare KV; GitHub is used only as a public source' };
   state.last_content_fingerprint = contentFingerprint;
@@ -1042,12 +1045,15 @@ async function runScanner(env, scheduledTime = Date.now()) {
     at: new Date(now).toISOString(),
     candidate_endpoints: pool.length,
     checked: batch.length,
-    moscow_tcp_ok: results.filter((result) => result?.ok).length,
+    moscow_pairs_ok: results.filter((result) => result?.ok).length,
+    moscow_measurements: results.reduce((sum, result) => sum + (result?.samples?.length || 0), 0),
     pending_or_errors: results.filter((result) => !result?.ok).length,
     estimated_sweep_minutes: calculateSweepMinutes(pool.length),
     probe_results: results.map((result, index) => ({
       endpoint: batch[index].key,
       status: result?.ok ? 'ok' : result?.pending ? 'pending' : 'failed',
+      measurements_completed: result?.samples?.length || 0,
+      measurement_successes: result?.samples?.filter((sample) => sample.ok).length || 0,
       latency_ms: result?.latency_ms ?? null,
       jitter_ms: result?.jitter_ms ?? null,
       loss_pct: result?.loss_pct ?? null,
