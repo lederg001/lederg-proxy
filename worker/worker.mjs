@@ -4,8 +4,8 @@ const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
 const GLOBALPING_API = 'https://api.globalping.io/v1';
 const GLOBALPING_REQUEST_TIMEOUT_MS = 9000;
-const GLOBALPING_POLL_ATTEMPTS = 8;
-const GLOBALPING_POLL_DELAY_MS = 600;
+const GLOBALPING_POLL_ATTEMPTS = 40;
+const GLOBALPING_POLL_DELAY_MS = 500;
 const HISTORY_SIZE = 5;
 const MOSCOW_CITY = 'Moscow';
 const MOSCOW_COUNTRY = 'RU';
@@ -467,6 +467,7 @@ export function parseGlobalpingTcpResult(payload) {
 }
 
 function findMoscowMeasurementEntry(payload) {
+  if (payload?.pending === true) return payload;
   if (payload?.status === 'in-progress') return { pending: true, error: 'Moscow measurement is still in progress' };
   const entries = Array.isArray(payload?.results) ? payload.results : [];
   const entry = entries.find(({ probe }) => {
@@ -621,7 +622,7 @@ async function requestGlobalpingMeasurement(target, type, measurementOptions, fe
         target,
         type,
         locations: [{ city: MOSCOW_CITY, country: MOSCOW_COUNTRY, limit: 1 }],
-        timeout: 20,
+        timeout: 10,
         measurementOptions,
       }),
     });
@@ -660,7 +661,6 @@ export async function probeMoscow(endpoint, kind = 'mtr', fetchFn = fetch) {
     const queryHost = endpoint.host.includes(':') || /^\\d+(?:\\.\\d+){3}$/.test(endpoint.host)
       ? 'ya.ru'
       : endpoint.host;
-    const query = `name=${encodeURIComponent(queryHost)}&type=A`;
     const measurement = await requestGlobalpingMeasurement(
       queryHost,
       'dns',
@@ -690,6 +690,7 @@ export async function probeMoscowDohTransport(fetchFn = fetch) {
     'common.dot.dns.yandex.net',
     'http',
     {
+      resolver: '77.88.8.8',
       protocol: 'HTTPS',
       port: 443,
       request: {
@@ -704,8 +705,9 @@ export async function probeMoscowDohTransport(fetchFn = fetch) {
 }
 
 export async function probeMoscowPair(endpoint, probeFn = probeMoscow) {
-  // One TCP MTR to the proxy port plus one real HTTPS DNS-over-HTTPS lookup from Moscow.
-  // 30 endpoints x 2 measurements x 4 scans/hour = 240 Globalping measurements/hour.
+  // One TCP MTR to the proxy port plus one Yandex UDP DNS A-record lookup per Moscow endpoint.
+  // A separate HTTPS/TLS reachability test to the Yandex DoH host runs once per scan.
+  // 30 endpoints x 2 measurements x 4 scans/hour + 4 DoH checks = 244 tests/hour.
   const [mtr, dns] = await Promise.all([
     probeFn(endpoint, 'mtr'),
     probeFn(endpoint, 'dns'),
@@ -824,7 +826,7 @@ export function applyProbeResult(state, endpoint, result, now) {
     } : previous.mtr || null,
     dns: result?.dns ? {
       ok: Boolean(result.dns.ok),
-      provider: result.dns.provider || 'Yandex DoH',
+      provider: result.dns.provider || 'Yandex DNS (77.88.8.8)',
       query_ms: result.dns.query_ms ?? null,
       answer_count: result.dns.answer_count ?? 0,
       tls_authorized: result.dns.tls_authorized === true,
