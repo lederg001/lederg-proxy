@@ -21,12 +21,29 @@ import {
 } from './worker.mjs';
 import {
   buildVlessProbeRequest,
+  buildWorkerTlsOptions,
   getVlessProbeSupport,
   verifyVlessProxy,
   verifyVlessServices,
   VLESS_SERVICE_PROBES,
   PROXY_VERIFY_LIMITS,
 } from './proxy-verifier.mjs';
+
+test('builds TLS options supported by Cloudflare Workers without unsupported ALPNProtocols', () => {
+  const options = buildWorkerTlsOptions({
+    socket: 'proxy-socket',
+    host: 'proxy.example.net',
+    servername: 'sni.example.net',
+  });
+
+  assert.deepEqual(options, {
+    socket: 'proxy-socket',
+    host: 'proxy.example.net',
+    servername: 'sni.example.net',
+    rejectUnauthorized: true,
+  });
+  assert.equal('ALPNProtocols' in options, false);
+});
 
 test('accepts a TCP ping from a Moscow, RU probe using Globalping measurement response shape', () => {
   const parsed = parseGlobalpingTcpResult({
