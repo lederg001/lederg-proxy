@@ -220,7 +220,7 @@ test('keeps each invocation below the free subrequest limit and completes a full
   // Two endpoints per minute, with MTR + DNS checks, produce 240 Globalping
   // measurements/hour. The DoH baseline runs at most four times/hour.
   assert.equal(30 * 2 * (60 / 15), 240);
-  assert.equal(240 + 4, 244);
+  assert.equal(240 + 1, 241);
 
   // Four measurements + one optional DoH measurement, each with one dispatch
   // and at most four polls, plus one source fetch: 26 external subrequests.
