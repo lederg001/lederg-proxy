@@ -12,10 +12,10 @@ const STATE_KEY = 'scanner-state-v1';
 const FEED_TTL_MS = 9 * 60 * 1000;
 const FEED_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_SOURCE_BYTES = 768 * 1024;
-const MAX_POOL_ENDPOINTS = 45;
+const MAX_POOL_ENDPOINTS = 30;
 const MAX_CONFIGS_PER_FEED = 120;
-const CHECKS_PER_RUN = 3;
-const PROBE_CONCURRENCY = 3;
+const CHECKS_PER_RUN = 2;
+const PROBE_CONCURRENCY = 2;
 const ACTIVE_TTL_MS = 35 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 12000;
 
@@ -518,6 +518,64 @@ export async function probeMoscow(endpoint, fetchFn = fetch) {
   return { pending: true, error: 'Moscow TCP measurement did not finish within the polling window' };
 }
 
+
+export async function probeMoscowPair(endpoint, probeFn = probeMoscow) {
+  // Two independent measurements of the same proxy endpoint are run in parallel.
+  // With two candidates per cron and a pool of 30, this uses 240 tests/hour.
+  const checks = await Promise.all([probeFn(endpoint), probeFn(endpoint)]);
+  const samples = checks
+    .filter((check) => check && !check.pending)
+    .map((check) => ({
+      at: new Date().toISOString(),
+      ok: Boolean(check.ok),
+      ...(check.ok ? {
+        latency_ms: Number(check.latency_ms),
+        jitter_ms: Number(check.jitter_ms) || 0,
+        loss_pct: Number(check.loss_pct) || 0,
+        network: check.network || null,
+      } : {
+        error: check.error || 'Moscow TCP measurement failed',
+      }),
+    }));
+
+  if (!samples.length) {
+    return {
+      pending: true,
+      error: checks.find((check) => check?.error)?.error || 'Both Moscow measurements are still pending',
+      samples: [],
+    };
+  }
+
+  const successful = samples.filter((sample) => sample.ok);
+  const latencies = successful.map((sample) => sample.latency_ms).sort((a, b) => a - b);
+  const median = latencies.length
+    ? (latencies.length % 2
+      ? latencies[(latencies.length - 1) / 2]
+      : (latencies[latencies.length / 2 - 1] + latencies[latencies.length / 2]) / 2)
+    : null;
+  const rttSpread = latencies.length > 1 ? Math.max(...latencies) - Math.min(...latencies) : 0;
+  const allCompleted = samples.length === 2;
+  const ok = allCompleted && successful.length === 2;
+  const lossValues = successful.map((sample) => sample.loss_pct || 0);
+  const averageLoss = lossValues.length
+    ? lossValues.reduce((sum, value) => sum + value, 0) / lossValues.length
+    : null;
+
+  return {
+    ok,
+    pending: !allCompleted,
+    samples,
+    latency_ms: median == null ? null : Math.round(median),
+    jitter_ms: Math.round(rttSpread),
+    loss_pct: averageLoss == null ? null : Math.round(averageLoss * 10) / 10,
+    network: successful.find((sample) => sample.network)?.network || null,
+    probe_location: 'Moscow',
+    error: ok ? null : (!allCompleted
+      ? 'One or more Moscow measurements are still pending'
+      : (samples.find((sample) => !sample.ok)?.error || 'Both Moscow TCP measurements must succeed')),
+  };
+}
+
 async function mapLimit(items, limit, mapper) {
   const output = new Array(items.length);
   let next = 0;
@@ -585,34 +643,45 @@ export function applyProbeResult(state, endpoint, result, now) {
     last_checked_at: new Date(now).toISOString(),
   };
 
+  const incomingSamples = Array.isArray(result?.samples)
+    ? result.samples.filter((sample) => sample && !sample.pending)
+    : (result?.pending ? [] : [result]);
+  const normalizedSamples = incomingSamples.map((sample) => sample.ok
+    ? {
+        at: new Date(now).toISOString(),
+        ok: true,
+        latency_ms: Number(sample.latency_ms),
+        jitter_ms: Number(sample.jitter_ms) || 0,
+        loss_pct: Number(sample.loss_pct) || 0,
+        network: sample.network || result.network || null,
+      }
+    : {
+        at: new Date(now).toISOString(),
+        ok: false,
+        error: sample.error || result?.error || 'Moscow TCP probe failed',
+      });
+
+  if (normalizedSamples.length) {
+    updated.recent_samples = [...(previous.recent_samples || []), ...normalizedSamples].slice(-HISTORY_SIZE);
+    const quality = evaluateMoscowHistory(updated.recent_samples);
+    Object.assign(updated, quality);
+
+    const latestSuccess = [...normalizedSamples].reverse().find((sample) => sample.ok);
+    if (latestSuccess) {
+      updated.last_success_at = new Date(now).toISOString();
+      updated.network = latestSuccess.network || previous.network || null;
+      updated.asn = result.asn || previous.asn || null;
+    }
+
+    const latestFailure = [...normalizedSamples].reverse().find((sample) => !sample.ok);
+    updated.last_probe_error = latestFailure?.error || result?.error || null;
+  }
+
   if (result?.pending) {
     updated.pending_count = Math.min(9, (previous.pending_count || 0) + 1);
     updated.last_probe_error = result.error || 'Moscow TCP test is still pending';
   } else {
     updated.pending_count = 0;
-    const sample = result?.ok
-      ? {
-          at: new Date(now).toISOString(),
-          ok: true,
-          latency_ms: Number(result.latency_ms),
-          jitter_ms: Number(result.jitter_ms) || 0,
-          loss_pct: Number(result.loss_pct) || 0,
-          network: result.network || null,
-        }
-      : {
-          at: new Date(now).toISOString(),
-          ok: false,
-          error: result?.error || 'Moscow TCP probe failed',
-        };
-    updated.recent_samples = [...(previous.recent_samples || []), sample].slice(-HISTORY_SIZE);
-    const quality = evaluateMoscowHistory(updated.recent_samples);
-    Object.assign(updated, quality);
-    updated.last_probe_error = result?.ok ? null : sample.error;
-    if (result?.ok) {
-      updated.last_success_at = new Date(now).toISOString();
-      updated.network = result.network || previous.network || null;
-      updated.asn = result.asn || previous.asn || null;
-    }
   }
 
   state.endpoints[endpoint.key] = updated;
@@ -943,7 +1012,7 @@ async function runScanner(env, scheduledTime = Date.now()) {
   const start = Math.max(0, Number(state.cursor) || 0) % pool.length;
   const batch = [];
   for (let i = 0; i < Math.min(CHECKS_PER_RUN, pool.length); i += 1) batch.push(pool[(start + i) % pool.length]);
-  const results = await mapLimit(batch, PROBE_CONCURRENCY, (endpoint) => probeMoscow(endpoint));
+  const results = await mapLimit(batch, PROBE_CONCURRENCY, (endpoint) => probeMoscowPair(endpoint));
   results.forEach((result, index) => applyProbeResult(state, batch[index], result, now));
   state.cursor = (start + batch.length) % pool.length;
 
@@ -1010,8 +1079,8 @@ export default {
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
         probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping' },
-        schedule: '* * * * * UTC; 3 Moscow TCP measurements per minute; 45 candidates per 15-minute sweep; 180 tests/hour max',
-        max_tests_per_hour: 180,
+        schedule: '* * * * * UTC; 2 Moscow endpoints per minute with 2 independent tests each; 30 candidates per 15-minute sweep; 240 tests/hour max',
+        max_tests_per_hour: 240,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
       }, { headers: { 'cache-control': 'no-store' } });
