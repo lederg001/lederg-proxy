@@ -1,3 +1,5 @@
+import { verifyVlessProxy } from './proxy-verifier.mjs';
+
 const REPO = 'lederg001/lederg-proxy';
 const BRANCH = 'main';
 const GLOBALPING_API = 'https://api.globalping.io/v1';
@@ -641,6 +643,8 @@ export function applyProbeResult(state, endpoint, result, now) {
     ...previous,
     probe_location: 'Moscow',
     last_checked_at: new Date(now).toISOString(),
+    last_pair_checked_at: new Date(now).toISOString(),
+    last_pair_ok: Boolean(result && !result.pending && result.ok),
   };
 
   const incomingSamples = Array.isArray(result?.samples)
@@ -688,14 +692,40 @@ export function applyProbeResult(state, endpoint, result, now) {
   return updated;
 }
 
+export function applyProxyVerificationResult(state, endpoint, config, result, now) {
+  const status = state.endpoints[endpoint.key] || {};
+  if (!status.verified_configs || typeof status.verified_configs !== 'object') status.verified_configs = {};
+  const verification = {
+    ok: Boolean(result?.ok && result?.supported !== false),
+    supported: result?.supported !== false,
+    verified_at: new Date(now).toISOString(),
+    verifier: result?.verifier || 'VLESS protocol + HTTP egress',
+    probe_location: result?.probe_location || 'Cloudflare Worker egress (not Moscow)',
+    connect_ms: Number.isFinite(Number(result?.connect_ms)) ? Number(result.connect_ms) : null,
+    tunnel_ms: Number.isFinite(Number(result?.tunnel_ms)) ? Number(result.tunnel_ms) : null,
+    download_ms: Number.isFinite(Number(result?.download_ms)) ? Number(result.download_ms) : null,
+    download_bytes: Number(result?.download_bytes) || 0,
+    download_mbps: Number(result?.download_mbps) || 0,
+    http_status: Number(result?.http_status) || null,
+    target: result?.target || null,
+    error: result?.ok ? null : (result?.error || 'Full proxy verification failed'),
+  };
+  status.verified_configs[config.uri] = verification;
+  state.endpoints[endpoint.key] = status;
+  return verification;
+}
+
 function getActiveNodes(pool, state, now) {
   const nodes = [];
   for (const endpoint of pool) {
     const status = state.endpoints[endpoint.key];
-    if (status?.probe_location !== 'Moscow' || !status.available || !Number.isFinite(Number(status.latency_ms))) continue;
+    if (status?.probe_location !== 'Moscow' || status.last_pair_ok !== true || !status.available || !Number.isFinite(Number(status.latency_ms))) continue;
     const lastSuccess = Date.parse(status.last_success_at || '');
     if (!Number.isFinite(lastSuccess) || now - lastSuccess > ACTIVE_TTL_MS) continue;
     for (const config of endpoint.configs) {
+      const functionalProbe = status.verified_configs?.[config.uri];
+      const functionalAt = Date.parse(functionalProbe?.verified_at || '');
+      if (!functionalProbe?.ok || !Number.isFinite(functionalAt) || now - functionalAt > ACTIVE_TTL_MS) continue;
       nodes.push({
         ...config,
         ping_ms: Number(status.latency_ms),
@@ -707,6 +737,7 @@ function getActiveNodes(pool, state, now) {
         endpoint: endpoint.key,
         probe_location: 'Moscow',
         probe_network: status.network || null,
+        functional_probe: functionalProbe,
       });
     }
   }
@@ -719,6 +750,7 @@ function getActiveNodes(pool, state, now) {
 
 export function renderHappSubscription(nodes) {
   const uris = (Array.isArray(nodes) ? nodes : [])
+    .filter((node) => node?.functional_probe?.ok === true)
     .filter((node) => typeof node?.uri === 'string' && /^(vless|vmess|ss|trojan|socks5?|hysteria2|hy2):\/\//i.test(node.uri))
     .sort((a, b) => Number(a.score ?? a.ping_ms ?? 999999) - Number(b.score ?? b.ping_ms ?? 999999))
     .map((node) => node.uri.trim());
@@ -896,11 +928,12 @@ export function buildHappJsonConfigs(nodes) {
     .sort((a, b) => Number(a.score ?? a.ping_ms ?? 999999) - Number(b.score ?? b.ping_ms ?? 999999));
   for (const node of sorted) {
     try {
+      if (node?.functional_probe?.ok !== true) continue;
       const proxy = createXrayOutbound(node);
       if (!proxy) continue;
       const location = node.country_name || COUNTRY_NAMES[node.country] || 'Unknown';
       profiles.push({
-        remarks: `${location} | ${String(node.protocol).toUpperCase()} | Moscow ${Math.round(Number(node.ping_ms) || 0)}ms`,
+        remarks: `${location} | ${String(node.protocol).toUpperCase()} | Moscow ${Math.round(Number(node.ping_ms) || 0)}ms | DL ${Number(node.functional_probe.download_mbps).toFixed(2)} Mbps`,
         log: { loglevel: 'warning' },
         dns: buildMoscowDnsConfig(),
         inbounds: [{
@@ -925,6 +958,20 @@ export function buildHappJsonConfigs(nodes) {
               ? `TLS + uTLS ${proxy.streamSettings.tlsSettings?.fingerprint || 'source fingerprint'}`
               : 'Native protocol settings from source link',
           dnsProviders: ['Yandex DoH', 'AdGuard DoH', 'Quad9 DoH', 'Google DoH'],
+          proxyVerification: {
+            level: node.functional_probe.verifier,
+            status: 'passed',
+            tested_at: node.functional_probe.verified_at,
+            probe_location: node.functional_probe.probe_location,
+            connect_ms: node.functional_probe.connect_ms,
+            tunnel_ms: node.functional_probe.tunnel_ms,
+            download_ms: node.functional_probe.download_ms,
+            download_bytes: node.functional_probe.download_bytes,
+            download_mbps: node.functional_probe.download_mbps,
+            http_status: node.functional_probe.http_status,
+            target: node.functional_probe.target,
+            note: 'Moscow reachability is measured separately by Globalping; protocol and speed check runs from Cloudflare Worker egress.',
+          },
         },
       });
       if (profiles.length >= 150) break;
@@ -951,8 +998,9 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       provider: 'Globalping community probes',
       city: MOSCOW_CITY,
       country: MOSCOW_COUNTRY,
-      method: 'TCP ping (3 packets)',
-      meaning: 'TCP reachability, average latency, RTT range and packet loss from a probe geolocated in Moscow, Russia; this does not authenticate a full VPN tunnel.',
+      method: 'Globalping TCP ping (3 packets) from Moscow, RU; separate VLESS authentication, tunneled HTTP and download test from Cloudflare Worker egress',
+      meaning: 'Moscow measurement confirms TCP reachability and RTT only. A profile is published only after a separate VLESS protocol response, HTTP 200 through the proxy, and a 64 KiB download speed test from Cloudflare Worker egress.',
+      functional_verification: { protocol: 'VLESS', transports: ['TCP', 'RAW', 'WebSocket'], security: ['none', 'TLS when endpoint SNI matches host'], min_download_bytes: 65536, min_download_mbps: 0.2, probe_location: 'Cloudflare Worker egress, not Moscow' },
     },
     stats: {
       candidate_endpoints: candidates,
@@ -961,6 +1009,8 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       measurements_this_run: measurements,
       active_endpoints: endpoints.size,
       active_configs: sorted.length,
+      fully_verified_configs: sorted.length,
+      average_download_mbps: sorted.length ? Number((sorted.reduce((sum, node) => sum + (Number(node.functional_probe?.download_mbps) || 0), 0) / sorted.length).toFixed(3)) : 0,
       estimated_sweep_minutes: calculateSweepMinutes(candidates),
       by_country: byCountry,
     },
@@ -982,6 +1032,15 @@ export function buildManifest({ now = new Date().toISOString(), candidates = 0, 
       probe_location: node.probe_location || 'Moscow',
       probe_network: node.probe_network || null,
       stable_checks: Number(node.stable_checks || 1),
+      protocol_verified: node.functional_probe?.ok === true,
+      verifier: node.functional_probe?.verifier || null,
+      verification_location: node.functional_probe?.probe_location || null,
+      proxy_connect_ms: node.functional_probe?.connect_ms ?? null,
+      proxy_tunnel_ms: node.functional_probe?.tunnel_ms ?? null,
+      speed_test_bytes: node.functional_probe?.download_bytes ?? 0,
+      download_mbps: node.functional_probe?.download_mbps ?? 0,
+      verification_http_status: node.functional_probe?.http_status ?? null,
+      verification_tested_at: node.functional_probe?.verified_at || null,
       uri: node.uri,
     })),
   };
@@ -1016,6 +1075,43 @@ async function runScanner(env, scheduledTime = Date.now()) {
   for (let i = 0; i < Math.min(CHECKS_PER_RUN, pool.length); i += 1) batch.push(pool[(start + i) % pool.length]);
   const results = await mapLimit(batch, PROBE_CONCURRENCY, (endpoint) => probeMoscowPair(endpoint));
   results.forEach((result, index) => applyProbeResult(state, batch[index], result, now));
+
+  const verificationJobs = [];
+  for (let index = 0; index < batch.length; index += 1) {
+    const endpoint = batch[index];
+    const moscowResult = results[index];
+    const selected = moscowResult?.ok ? endpoint.configs.slice(0, 3) : [];
+    const selectedUris = new Set(selected.map((config) => config.uri));
+    for (const config of endpoint.configs) {
+      if (selectedUris.has(config.uri)) {
+        verificationJobs.push({ endpoint, config });
+      } else {
+        applyProxyVerificationResult(state, endpoint, config, {
+          ok: false,
+          supported: false,
+          error: moscowResult?.ok
+            ? 'Not selected for this scan cycle (per-endpoint verification cap)'
+            : (moscowResult?.error || 'Moscow TCP pair did not pass'),
+        }, now);
+      }
+    }
+  }
+  const verificationResults = await mapLimit(
+    verificationJobs,
+    2,
+    ({ config }) => verifyVlessProxy(config),
+  );
+  verificationResults.forEach((result, index) => {
+    const job = verificationJobs[index];
+    applyProxyVerificationResult(state, job.endpoint, job.config, result, now);
+  });
+  const protocolPassed = verificationResults.filter((result) => result?.ok).length;
+  const protocolUnsupported = verificationResults.filter((result) => result?.supported === false).length;
+  const speedSamples = verificationResults.filter((result) => result?.ok && Number.isFinite(Number(result.download_mbps)));
+  const averageDownloadMbps = speedSamples.length
+    ? Number((speedSamples.reduce((sum, result) => sum + Number(result.download_mbps), 0) / speedSamples.length).toFixed(3))
+    : 0;
+  const downloadBytes = speedSamples.reduce((sum, result) => sum + (Number(result.download_bytes) || 0), 0);
   state.cursor = (start + batch.length) % pool.length;
 
   const poolKeys = new Set(pool.map((item) => item.key));
@@ -1049,6 +1145,11 @@ async function runScanner(env, scheduledTime = Date.now()) {
     moscow_measurements: results.reduce((sum, result) => sum + (result?.samples?.length || 0), 0),
     pending_or_errors: results.filter((result) => !result?.ok).length,
     estimated_sweep_minutes: calculateSweepMinutes(pool.length),
+    protocol_checks: verificationResults.length,
+    protocol_passed: protocolPassed,
+    protocol_unsupported: protocolUnsupported,
+    speed_test_bytes: downloadBytes,
+    average_download_mbps: averageDownloadMbps,
     probe_results: results.map((result, index) => ({
       endpoint: batch[index].key,
       status: result?.ok ? 'ok' : result?.pending ? 'pending' : 'failed',
@@ -1084,8 +1185,8 @@ export default {
         repository: REPO,
         branch: BRANCH,
         output_files: ['json', 'happ.txt', 'manifest.json'],
-        probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping' },
-        schedule: '* * * * * UTC; 2 Moscow endpoints per minute with 2 independent tests each; 30 candidates per 15-minute sweep; 240 tests/hour max',
+        probe: { provider: 'Globalping community probes', city: MOSCOW_CITY, country: MOSCOW_COUNTRY, method: 'TCP ping + separate VLESS tunnel and speed test from Cloudflare Worker egress' },
+        schedule: '* * * * * UTC; Moscow paired TCP checks + authenticated VLESS tunnel and 64 KiB HTTP download; 30 candidates per 15-minute sweep; 240 Globalping tests/hour max',
         max_tests_per_hour: 240,
         estimated_full_pool_cycle_minutes: calculateSweepMinutes(MAX_POOL_ENDPOINTS),
         last_run: state.last_run || null,
