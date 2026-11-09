@@ -204,12 +204,12 @@ test('parses a public VLESS config and rejects a private endpoint', () => {
   assert.equal(invalid, null);
 });
 
-test('a 30-endpoint Moscow pool stays below the public Globalping hourly limit with paired probes', () => {
-  assert.equal(calculateSweepMinutes(30, 2), 15);
-  assert.equal(2 * 2 * 60, 240);
+test('checks all 30 candidates every 15 minutes and stays below the Globalping hourly limit', () => {
+  assert.equal(calculateSweepMinutes(30, 30), 15);
+  assert.equal(30 * 2 * (60 / 15), 240);
   assert.equal(240 < 250, true);
-  assert.equal(calculateSweepMinutes(31, 2), 16);
-  assert.equal(calculateSweepMinutes(0, 3), 0);
+  assert.equal(calculateSweepMinutes(31, 30), 30);
+  assert.equal(calculateSweepMinutes(0, 30), 0);
 });
 
 
