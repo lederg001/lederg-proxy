@@ -683,14 +683,18 @@ async function requestGlobalpingMeasurement(target, type, measurementOptions, fe
   return { pending: true, error: `Moscow ${type.toUpperCase()} measurement did not finish within the polling window` };
 }
 
+export function getMoscowDnsQueryHost(host) {
+  const value = String(host ?? '').trim();
+  // Globalping DNS resolve accepts domain names, so IP endpoints use a stable hostname target.
+  return value.includes(':') || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value) ? 'ya.ru' : value;
+}
+
 export async function probeMoscow(endpoint, kind = 'mtr', fetchFn = fetch) {
   if (!endpoint?.host || !Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535) {
     return { ok: false, error: 'Invalid TCP endpoint' };
   }
   if (kind === 'dns') {
-    const queryHost = endpoint.host.includes(':') || /^\\d+(?:\\.\\d+){3}$/.test(endpoint.host)
-      ? 'ya.ru'
-      : endpoint.host;
+    const queryHost = getMoscowDnsQueryHost(endpoint.host);
     const measurement = await requestGlobalpingMeasurement(
       queryHost,
       'dns',
