@@ -616,6 +616,7 @@ async function openVlessTunnel(node, targetHost, targetPort, dependencies = {}) 
   const connect = dependencies.connect || netModule.connect;
   const tlsConnect = dependencies.tlsConnect || tlsModule.connect;
   const Duplex = dependencies.Duplex || streamModule.Duplex;
+  const startedAt = performance.now();
   const rawSocket = connect({ host: node.host, port: node.port });
   let proxySocket = rawSocket;
   let websocketStream = null;
@@ -669,7 +670,7 @@ async function openVlessTunnel(node, targetHost, targetPort, dependencies = {}) 
     return {
       socket: tunnelSocket,
       connectedAt,
-      connect_ms: Math.round(connectedAt - (rawSocket.connecting ? connectedAt : (rawSocket._connectStart || connectedAt))),
+      connect_ms: Math.round(connectedAt - startedAt),
       close() {
         try { websocketStream?.destroy(); } catch { /* best-effort cleanup */ }
         try { proxySocket?.destroy(); } catch { /* best-effort cleanup */ }
