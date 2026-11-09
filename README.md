@@ -15,13 +15,13 @@ Add one subscription URL to HAPP. The JSON output includes resolver and transpor
 
 - Measurement network: [Globalping](https://globalping.io/) community probes.
 - Required location: city `Moscow`, country `RU`. Results from other locations are rejected.
-- Measurement: TCP ping to the exact proxy host and port, 3 packets per measurement.
+- Measurement: TCP MTR (5 packets per hop) to the exact proxy host and port, plus a Yandex DNS A-record lookup from a Moscow community probe. The Yandex DoH HTTPS/TLS endpoint is checked once per hour.
 - Each candidate gets a rolling history of up to 5 measurements.
 - Ranking uses median Moscow latency, RTT spread (jitter), packet loss and recent reliability.
 - A node is only published after at least two successful Moscow measurements, at least 80% recent reliability, and two consecutive recent successes.
 - Two consecutive failures remove it from the active set.
 - The full verifier currently publishes only VLESS nodes using TCP, RAW or WebSocket transports and compatible security settings; VMess, Trojan, Shadowsocks, SOCKS and Hysteria2 remain excluded until their own end-to-end verifiers are implemented. The pool is capped at 30 unique TCP endpoints. Two endpoints are selected per minute, and each receives two independent Moscow TCP measurements in parallel: 4 tests/minute, 240 tests/hour, and a 15-minute full sweep (below Globalping's unauthenticated 250 tests/hour limit).
-- This is a TCP availability/routing measurement, not a full protocol authentication or throughput test. UDP-only Hysteria2 nodes are excluded from the Moscow TCP pool.
+- Full verification then performs VLESS authentication, an HTTP download sample, and HTTPS checks for YouTube (`www.youtube.com/generate_204`) and Discord (`discord.com/api/v10/gateway`) through the proxy from Cloudflare Worker egress. These two service checks must both pass before a node is published. UDP-only Hysteria2 nodes are excluded from the Moscow TCP pool. YouTube/Discord test location is the Worker egress, not Moscow.
 
 ## DNS and TLS profile settings
 
@@ -45,7 +45,7 @@ TLS profiles use the Chrome uTLS fingerprint by default and preserve source-prov
 
 ## Important limitations
 
-Moscow TCP ping indicates that the proxy's port is reachable from a Moscow community probe. It does not prove the VLESS/VMess/Trojan/SS credentials work, that the remote server forwards traffic, or that every Russian ISP has the same route. The Moscow probe may use a different ISP/ASN from the user.
+Moscow MTR/DNS measurements indicate route and resolver behavior from a Moscow community probe. They do not prove that every Russian ISP has the same route. VLESS authentication, download, YouTube and Discord are checked separately through the proxy from Cloudflare Worker egress. The Moscow probe may use a different ISP/ASN from the user.
 
 DNS-over-HTTPS and TLS/REALITY settings are client-side profile settings; they do not alter the public proxy server. TLS fingerprinting only applies to TLS-capable configurations. REALITY requires the actual server-side parameters supplied in the original link. FakeDNS is a separate Xray feature and is not enabled by default because it can break DNS behavior when the HAPP profile is consumed through a different TUN/DNS setup.
 
