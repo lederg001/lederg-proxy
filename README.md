@@ -20,7 +20,7 @@ Add one subscription URL to HAPP. The JSON output includes resolver and transpor
 - Ranking uses median Moscow latency, RTT spread (jitter), packet loss and recent reliability.
 - A node is only published after at least two successful Moscow measurements, at least 80% recent reliability, and two consecutive recent successes.
 - Two consecutive failures remove it from the active set.
-- The pool is capped at 45 unique TCP endpoints. Three measurements run per minute, giving a 15-minute full sweep (180 tests/hour, below Globalping's unauthenticated 250 tests/hour limit).
+- The pool is capped at 30 unique TCP endpoints. Two endpoints are selected per minute, and each receives two independent Moscow TCP measurements in parallel: 4 tests/minute, 240 tests/hour, and a 15-minute full sweep (below Globalping's unauthenticated 250 tests/hour limit).
 - This is a TCP availability/routing measurement, not a full protocol authentication or throughput test. UDP-only Hysteria2 nodes are excluded from the Moscow TCP pool.
 
 ## DNS and TLS profile settings
@@ -28,9 +28,9 @@ Add one subscription URL to HAPP. The JSON output includes resolver and transpor
 Xray JSON profiles use non-Cloudflare DNS-over-HTTPS resolvers, in this order:
 
 1. Yandex DoH — `https://common.dot.dns.yandex.net/dns-query`
-2. Google DoH — `https://dns.google/dns-query`
-3. AdGuard DoH — `https://dns.adguard-dns.com/dns-query`
-4. Quad9 DoH — `https://dns.quad9.net/dns-query`
+2. AdGuard Unfiltered DoH — `https://unfiltered.adguard-dns.com/dns-query`
+3. Quad9 non-filtering DoH — `https://dns10.quad9.net/dns-query`
+4. Google DoH — `https://dns.google/dns-query`
 
 Resolver hostnames are mapped to their published IP addresses to avoid DNS bootstrap loops. Xray uses sequential fallback if a resolver fails. Queries are configured to follow Xray routing rather than using `+local` direct mode.
 
