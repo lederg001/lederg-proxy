@@ -919,10 +919,10 @@ export function buildHappJsonConfigs(nodes) {
         meta: {
           serverDescription: `${node.source || 'public source'}; Moscow TCP ${Math.round(Number(node.ping_ms) || 0)}ms; RTT spread ${Math.round(Number(node.jitter_ms) || 0)}ms; loss ${Number(node.loss_pct) || 0}%`,
           moscowProbe: { city: 'Moscow', country: 'RU', network: node.probe_network || null },
-          tlsCamouflage: node.protocol === 'vless' && /[?&]security=reality(?:&|$)/i.test(node.uri)
-            ? 'REALITY + uTLS fingerprint from source link'
-            : /[?&]security=tls(?:&|$)/i.test(node.uri) || node.protocol === 'trojan'
-              ? 'TLS + uTLS Chrome fingerprint'
+          tlsCamouflage: proxy.streamSettings?.security === 'reality'
+            ? `REALITY + uTLS ${proxy.streamSettings.realitySettings?.fingerprint || 'source fingerprint'}`
+            : proxy.streamSettings?.security === 'tls'
+              ? `TLS + uTLS ${proxy.streamSettings.tlsSettings?.fingerprint || 'source fingerprint'}`
               : 'Native protocol settings from source link',
           dnsProviders: ['Yandex DoH', 'AdGuard DoH', 'Quad9 DoH', 'Google DoH'],
         },
